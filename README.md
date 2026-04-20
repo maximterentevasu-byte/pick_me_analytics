@@ -75,14 +75,14 @@ cp .env.example .env
 
 ## 1) Получить Telegram API ID / API HASH
 Создай приложение в Telegram API development tools и забери:
-- `TELEGRAM_API_ID`
-- `TELEGRAM_API_HASH`
+- `TELEGRAM_API_ID` или `TG_API_ID`
+- `TELEGRAM_API_HASH` или `TG_API_HASH`
 
 ## 2) Сгенерировать String Session
 В `.env` временно задай:
 ```env
-TELEGRAM_API_ID=123456
-TELEGRAM_API_HASH=your_hash
+TG_API_ID=123456
+TG_API_HASH=your_hash
 ```
 
 Потом:
@@ -95,7 +95,7 @@ npm run session
 - код из Telegram;
 - пароль 2FA, если включён.
 
-На выходе получишь `TELEGRAM_STRING_SESSION` — его и нужно положить в Railway.
+На выходе получишь `TELEGRAM_STRING_SESSION` или можешь сохранить это же значение в `TG_STRING_SESSION` — проект понимает оба варианта.
 
 ## 3) Подключить Google Sheets
 Создай service account в Google Cloud и дай ему доступ на редактирование нужной таблицы.
@@ -114,9 +114,9 @@ GOOGLE_SHEET_ID=...
 GOOGLE_SHEET_TAB=Metrics
 GOOGLE_SERVICE_ACCOUNT_EMAIL=service-account@project.iam.gserviceaccount.com
 GOOGLE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-TELEGRAM_API_ID=123456
-TELEGRAM_API_HASH=...
-TELEGRAM_STRING_SESSION=...
+TG_API_ID=123456
+TG_API_HASH=...
+TG_STRING_SESSION=...
 CRON_SCHEDULE=5 0 * * 1
 APPEND_HEADERS_IF_EMPTY=true
 DRY_RUN=false
@@ -144,7 +144,7 @@ npm start
 
 ## Railway
 1. Создай новый сервис из GitHub-репозитория.
-2. Добавь все ENV-переменные из `.env.example`.
+2. Добавь все ENV-переменные из `.env.example`. Если у тебя уже используются старые имена `TG_*`, их можно не переименовывать — проект их поддерживает.
 3. Start Command:
 ```bash
 npm start
