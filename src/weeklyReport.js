@@ -53,6 +53,20 @@ function truncateText(text, maxLen = 160) {
   const clean = String(text).replace(/\s+/g, " ").trim();
   return clean.length > maxLen ? clean.slice(0, maxLen - 1) + "…" : clean;
 }
+function delta(current, previous, d = 2) {
+  if (previous === null || previous === undefined || previous === "") return "";
+  const a = Number(current);
+  const b = Number(previous);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return "";
+  return Number((a - b).toFixed(d));
+}
+function deltaPct(current, previous, d = 2) {
+  if (previous === null || previous === undefined || previous === "") return "";
+  const a = Number(current);
+  const b = Number(previous);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b === 0) return "";
+  return Number((((a - b) / b) * 100).toFixed(d));
+}
 
 async function initTelegram() {
   const client = new TelegramClient(
@@ -85,7 +99,11 @@ async function ensureHeaders(sheets) {
     "Engagement/post","Engagement/1000",
     "Виральность%","Viral Index",
     "Индекс качества",
-    "Лучший пост (views)","Худший пост (views)"
+    "Лучший пост (views)","Худший пост (views)",
+    "Δ Средний просмотр","Δ% Средний просмотр",
+    "Δ ER (просмотры)%","Δ% ER (просмотры)%",
+    "Δ ER (активности)%","Δ% ER (активности)%",
+    "Δ Индекс качества","Δ% Индекс качества"
   ]];
 
   const rawHeader = [[
@@ -143,6 +161,28 @@ async function appendRaw(sheets, rows) {
   });
 }
 
+async function getPreviousWeeklyRow(sheets, channel) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: "weekly_stats!A2:AB"
+  }).catch(() => ({ data: {} }));
+
+  const rows = res.data.values || [];
+  const sameChannel = rows.filter(r => (r[2] || "").trim() === channel);
+
+  if (!sameChannel.length) return null;
+
+  // Берём последнюю запись по каналу
+  const last = sameChannel[sameChannel.length - 1];
+
+  return {
+    avgViews: last[4],
+    erViews: last[6],
+    erAct: last[7],
+    quality: last[17]
+  };
+}
+
 async function getStats(client, channel, range) {
   const entity = await client.getEntity(channel);
   const full = await client.invoke(new Api.channels.GetFullChannel({ channel: entity }));
@@ -184,17 +224,16 @@ async function getStats(client, channel, range) {
   const best = Math.max(...views, 0);
   const worst = views.length ? Math.min(...views) : 0;
 
-  const weeklyRow = [
-    range.startStr, range.endStr, channel, subs,
+  const metrics = {
+    subs,
     avgViews, medViews,
     erViews, erAct,
     avgReact, avgComm, avgRepost,
-    posts.length, totalViews,
+    postsCount: posts.length, totalViews,
     engagement, engagement1000,
     virality, viralIndex,
-    quality,
-    best, worst
-  ];
+    quality, best, worst
+  };
 
   const rawRows = posts.map(m => {
     const v = m.views || 0;
@@ -217,11 +256,11 @@ async function getStats(client, channel, range) {
     ];
   });
 
-  return { weeklyRow, rawRows, postsCount: posts.length };
+  return { metrics, rawRows };
 }
 
 async function main() {
-  console.log("STEP 2 RUN");
+  console.log("STEP 3 RUN");
 
   const client = await initTelegram();
   const sheets = await initSheets();
@@ -236,8 +275,40 @@ async function main() {
 
   for (const ch of channels) {
     console.log("CHANNEL:", ch);
-    const { weeklyRow, rawRows: channelRaw, postsCount } = await getStats(client, ch, range);
-    console.log("POSTS FOUND:", postsCount);
+
+    const prev = await getPreviousWeeklyRow(sheets, ch);
+    const { metrics, rawRows: channelRaw } = await getStats(client, ch, range);
+
+    console.log("POSTS FOUND:", metrics.postsCount);
+
+    const dAvgViews = delta(metrics.avgViews, prev?.avgViews);
+    const dAvgViewsPct = deltaPct(metrics.avgViews, prev?.avgViews);
+
+    const dErViews = delta(metrics.erViews, prev?.erViews);
+    const dErViewsPct = deltaPct(metrics.erViews, prev?.erViews);
+
+    const dErAct = delta(metrics.erAct, prev?.erAct);
+    const dErActPct = deltaPct(metrics.erAct, prev?.erAct);
+
+    const dQuality = delta(metrics.quality, prev?.quality);
+    const dQualityPct = deltaPct(metrics.quality, prev?.quality);
+
+    const weeklyRow = [
+      range.startStr, range.endStr, ch, metrics.subs,
+      metrics.avgViews, metrics.medViews,
+      metrics.erViews, metrics.erAct,
+      metrics.avgReact, metrics.avgComm, metrics.avgRepost,
+      metrics.postsCount, metrics.totalViews,
+      metrics.engagement, metrics.engagement1000,
+      metrics.virality, metrics.viralIndex,
+      metrics.quality,
+      metrics.best, metrics.worst,
+      dAvgViews, dAvgViewsPct,
+      dErViews, dErViewsPct,
+      dErAct, dErActPct,
+      dQuality, dQualityPct
+    ];
+
     weeklyRows.push(weeklyRow);
     rawRows.push(...channelRaw);
   }
@@ -246,7 +317,7 @@ async function main() {
   await appendRaw(sheets, rawRows);
 
   await client.disconnect();
-  console.log("STEP 2 DONE");
+  console.log("STEP 3 DONE");
 }
 
 main().catch(err => {
