@@ -72,7 +72,18 @@ function commentsCount(message) {
 
 function toDate(message) {
   if (!message?.date) return null;
-  if (message.date instanceof Date) return message.date;
+
+  // gramJS иногда даёт timestamp (секунды)
+  if (typeof message.date === "number") {
+    return new Date(message.date * 1000);
+  }
+
+  // иногда уже Date
+  if (message.date instanceof Date) {
+    return message.date;
+  }
+
+  // fallback
   return new Date(message.date);
 }
 
