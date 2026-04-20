@@ -18,14 +18,53 @@ function pct(part, total, digits = 2) {
   return Number(((part / total) * 100).toFixed(digits));
 }
 
-function periodLabel() {
+// Прошлая завершённая неделя: Пн 00:00:00 UTC -> след. Пн 00:00:00 UTC (не включая правую границу)
+function weekRange() {
   const now = new Date();
-  const iso = now.toISOString().slice(0, 10);
-  return { startStr: iso, endStr: iso };
+
+  const utcToday = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    0, 0, 0, 0
+  ));
+
+  const day = utcToday.getUTCDay(); // 0=Sun ... 6=Sat
+  const daysSinceMonday = (day + 6) % 7;
+
+  const currentMonday = new Date(utcToday);
+  currentMonday.setUTCDate(utcToday.getUTCDate() - daysSinceMonday);
+
+  const start = new Date(currentMonday);
+  start.setUTCDate(currentMonday.getUTCDate() - 7);
+  start.setUTCHours(0, 0, 0, 0);
+
+  const endExclusive = new Date(currentMonday);
+  endExclusive.setUTCHours(0, 0, 0, 0);
+
+  const endDisplay = new Date(endExclusive);
+  endDisplay.setUTCDate(endExclusive.getUTCDate() - 1);
+
+  return {
+    start,
+    endExclusive,
+    startStr: start.toISOString().slice(0, 10),
+    endStr: endDisplay.toISOString().slice(0, 10)
+  };
 }
 
 function reactionsCount(message) {
   return (message?.reactions?.results || []).reduce((acc, item) => acc + (item.count || 0), 0);
+}
+
+function commentsCount(message) {
+  return message?.replies?.replies || 0;
+}
+
+function messageDateToDate(msg) {
+  if (!msg?.date) return null;
+  if (msg.date instanceof Date) return msg.date;
+  return new Date(msg.date);
 }
 
 async function initTelegram() {
@@ -133,26 +172,42 @@ async function appendRows(sheets, rows) {
   });
 }
 
-async function getChannelStats(client, channelRef) {
+async function getChannelStats(client, channelRef, range) {
   console.log(`Собираю: ${channelRef}`);
+  console.log(`WEEK RANGE: ${range.start.toISOString()} -> ${range.endExclusive.toISOString()} (exclusive)`);
 
   const entity = await client.getEntity(channelRef);
   const full = await client.invoke(new Api.channels.GetFullChannel({ channel: entity }));
-  const subscribers = full?.fullChat?.participantsCount || 0;
 
-  const raw = await client.getMessages(entity, { limit: 100 });
+  const subscribers =
+    full?.fullChat?.participantsCount ||
+    full?.fullChat?.participants_count ||
+    0;
+
+  // Берём большой диапазон сообщений и фильтруем по реальным датам.
+  // Без break, чтобы не потерять посты из-за неожиданных структур/дат.
+  const raw = await client.getMessages(entity, { limit: 1000 });
 
   const posts = raw.filter((m) => {
-    const hasContent = Boolean(m?.message || m?.media);
+    const dt = messageDateToDate(m);
+    if (!dt || Number.isNaN(dt.getTime())) return false;
+
+    const inWeek = dt >= range.start && dt < range.endExclusive;
+    if (!inWeek) return false;
+
     const hasMetrics = (m?.views || 0) > 0 || (m?.forwards || 0) > 0 || reactionsCount(m) > 0;
+    const hasContent = Boolean(m?.message || m?.media);
     return !m?.action && (m?.post === true || hasMetrics || hasContent);
   });
 
   console.log(`POSTS FOUND: ${posts.length}`);
 
+  const newestPostDate = posts[0]?.date ? messageDateToDate(posts[0]).toISOString() : "";
+  const oldestPostDate = posts[posts.length - 1]?.date ? messageDateToDate(posts[posts.length - 1]).toISOString() : "";
+
   const views = posts.map((m) => m.views || 0);
   const reactions = posts.map(reactionsCount);
-  const comments = posts.map((m) => m.replies?.replies || 0);
+  const comments = posts.map(commentsCount);
   const reposts = posts.map((m) => m.forwards || 0);
 
   const avgViews = avg(views);
@@ -178,9 +233,6 @@ async function getChannelStats(client, channelRef) {
   const viralityPct = totalViews ? Number(((totalReposts / totalViews) * 100).toFixed(2)) : 0;
   const contentQualityIndex = Number(((postErViews * 0.6) + (postErActivities * 0.4)).toFixed(2));
 
-  const newestPostDate = posts[0]?.date ? new Date(posts[0].date).toISOString() : "";
-  const oldestPostDate = posts[posts.length - 1]?.date ? new Date(posts[posts.length - 1].date).toISOString() : "";
-
   console.log(`OK: ${channelRef}`);
 
   return {
@@ -193,12 +245,14 @@ async function getChannelStats(client, channelRef) {
     avgCommentsPost: avgComments,
     avgRepostsPost: avgReposts,
     postsCount: posts.length,
+
     avgReachStory: 0,
     avgViewsStory: 0,
     storyErViews: 0,
     storyErActivities: 0,
     storiesCount: 0,
     enabledNotificationsPct: 0,
+
     totalViews,
     totalReactions,
     totalComments,
@@ -214,10 +268,10 @@ async function getChannelStats(client, channelRef) {
   };
 }
 
-function toRow(channelRef, labels, s) {
+function toRow(channelRef, range, s) {
   return [
-    labels.startStr,
-    labels.endStr,
+    range.startStr,
+    range.endStr,
     channelRef,
     s.subscribers,
     s.avgReachPost,
@@ -263,12 +317,12 @@ async function main() {
 
   const client = await initTelegram();
   const sheets = await initGoogleSheets();
-  const labels = periodLabel();
+  const range = weekRange();
 
   const rows = [];
   for (const channel of channels) {
-    const stats = await getChannelStats(client, channel);
-    rows.push(toRow(channel, labels, stats));
+    const stats = await getChannelStats(client, channel, range);
+    rows.push(toRow(channel, range, stats));
   }
 
   await ensureSheetHeader(sheets);
