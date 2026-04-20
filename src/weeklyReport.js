@@ -1,18 +1,68 @@
-// заменяй файл src/weeklyReport.js этим содержимым
 require("dotenv").config();
 
-const { TelegramClient } = require("telegram");
+const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
-const { Api } = require("telegram");
 const { google } = require("googleapis");
 
+function avg(arr, digits = 2) {
+  if (!arr.length) return 0;
+  return Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(digits));
+}
+
+function sum(arr) {
+  return arr.reduce((a, b) => a + b, 0);
+}
+
+function pct(part, total, digits = 2) {
+  if (!total) return 0;
+  return Number(((part / total) * 100).toFixed(digits));
+}
+
+function weekRange() {
+  const now = new Date();
+  const utc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const day = utc.getUTCDay();
+  const daysSinceMonday = (day + 6) % 7;
+
+  const currentMonday = new Date(utc);
+  currentMonday.setUTCDate(utc.getUTCDate() - daysSinceMonday);
+
+  const start = new Date(currentMonday);
+  start.setUTCDate(currentMonday.getUTCDate() - 7);
+  start.setUTCHours(0, 0, 0, 0);
+
+  const end = new Date(currentMonday);
+  end.setUTCSeconds(-1);
+
+  return {
+    start,
+    end,
+    startStr: start.toISOString().slice(0, 10),
+    endStr: end.toISOString().slice(0, 10)
+  };
+}
+
+function reactionsCount(message) {
+  return (message?.reactions?.results || []).reduce((acc, item) => acc + (item.count || 0), 0);
+}
+
+function commentsCount(message) {
+  return message?.replies?.replies || 0;
+}
+
 async function initTelegram() {
-  const client = new TelegramClient(
-    new StringSession(process.env.TG_STRING_SESSION),
-    Number(process.env.TG_API_ID),
-    process.env.TG_API_HASH,
-    { connectionRetries: 5 }
-  );
+  const apiId = Number(process.env.TG_API_ID);
+  const apiHash = process.env.TG_API_HASH;
+  const session = process.env.TG_STRING_SESSION || "";
+
+  if (!apiId || !apiHash || !session) {
+    throw new Error("Проверь TG_API_ID / TG_API_HASH / TG_STRING_SESSION");
+  }
+
+  const client = new TelegramClient(new StringSession(session), apiId, apiHash, {
+    connectionRetries: 5
+  });
+
   await client.connect();
   return client;
 }
@@ -22,7 +72,9 @@ async function initGoogleSheets() {
     !process.env.GOOGLE_SHEET_ID ||
     !process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL ||
     !process.env.GOOGLE_PRIVATE_KEY
-  ) return null;
+  ) {
+    throw new Error("Не заданы GOOGLE_SHEET_ID / GOOGLE_SERVICE_ACCOUNT_EMAIL / GOOGLE_PRIVATE_KEY");
+  }
 
   const auth = new google.auth.JWT({
     email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
@@ -32,20 +84,42 @@ async function initGoogleSheets() {
 
   await auth.authorize();
 
-  return google.sheets({ version: "v4", auth });
+  return google.sheets({
+    version: "v4",
+    auth
+  });
 }
 
-async function appendToGoogleSheet(sheets, rows) {
-  if (!sheets) return;
-
+async function ensureSheetHeader(sheets) {
   const header = [
-    "Дата начала недели","Дата конца недели","Канал","Подписчики",
-    "Средний охват поста","Средний просмотр поста","ER (по просмотрам) %",
-    "ER (по активностям) %","Ср. кол-во реакций","Ср. кол-во комментариев",
-    "Ср. кол-во репостов","Кол-во постов","Средний охват сторис",
-    "Средний просмотр сторис","ER сторис (по просмотрам) %",
-    "ER сторис (по активностям) %","Кол-во сторис",
-    "Доля пользователей с включёнными уведомлениями %"
+    "Дата начала недели",
+    "Дата конца недели",
+    "Канал",
+    "Подписчики",
+    "Средний охват поста",
+    "Средний просмотр поста",
+    "ER (по просмотрам) %",
+    "ER (по активностям) %",
+    "Ср. кол-во реакций",
+    "Ср. кол-во комментариев",
+    "Ср. кол-во репостов",
+    "Кол-во постов",
+    "Средний охват сторис",
+    "Средний просмотр сторис",
+    "ER сторис (по просмотрам) %",
+    "ER сторис (по активностям) %",
+    "Кол-во сторис",
+    "Доля пользователей с включёнными уведомлениями %",
+    "Сумма просмотров постов",
+    "Сумма реакций",
+    "Сумма комментариев",
+    "Сумма репостов",
+    "Engagement на пост",
+    "Реакции на 1000 просмотров",
+    "Репосты на 1000 просмотров",
+    "Комментариев на 1000 просмотров",
+    "Виральность постов %",
+    "Индекс качества контента"
   ];
 
   const existing = await sheets.spreadsheets.values.get({
@@ -53,94 +127,174 @@ async function appendToGoogleSheet(sheets, rows) {
     range: "weekly_stats!A1:A1"
   });
 
-  if (!existing.data.values) {
+  const isEmpty = !existing.data.values || existing.data.values.length === 0;
+
+  if (isEmpty) {
     await sheets.spreadsheets.values.update({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: "weekly_stats!A1",
+      range: "weekly_stats!A1:AB1",
       valueInputOption: "RAW",
-      requestBody: { values: [header] }
+      requestBody: {
+        values: [header]
+      }
     });
   }
+}
 
+async function appendRows(sheets, rows) {
   await sheets.spreadsheets.values.append({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
     range: "weekly_stats!A2",
     valueInputOption: "RAW",
     insertDataOption: "INSERT_ROWS",
-    requestBody: { values: rows }
+    requestBody: {
+      values: rows
+    }
   });
 }
 
-async function getChannelStats(client, channelUsername) {
-  console.log(`Собираю: ${channelUsername}`);
+async function getChannelStats(client, channelRef, range) {
+  console.log(`Собираю: ${channelRef}`);
 
-  const entity = await client.getEntity(channelUsername);
+  const entity = await client.getEntity(channelRef);
   const full = await client.invoke(new Api.channels.GetFullChannel({ channel: entity }));
+  const subscribers = full?.fullChat?.participantsCount || 0;
 
-  const subscribers = full.fullChat.participantsCount || 0;
-  const posts = await client.getMessages(entity, { limit: 50 });
-  const validPosts = posts.filter(p => p.message);
+  const posts = [];
+  for await (const msg of client.iterMessages(entity, { limit: 300 })) {
+    if (!msg?.date) continue;
+    const dt = new Date(msg.date);
 
-  const views = validPosts.map(p => p.views || 0);
-  const reactions = validPosts.map(p => p.reactions?.results?.reduce((a, r) => a + r.count, 0) || 0);
-  const forwards = validPosts.map(p => p.forwards || 0);
+    if (dt < range.start) break;
+    if (dt > range.end) continue;
+    if (msg.post !== true) continue;
+    if (msg.action) continue;
+
+    posts.push(msg);
+  }
+
+  const views = posts.map((m) => m.views || 0);
+  const reactions = posts.map(reactionsCount);
+  const comments = posts.map(commentsCount);
+  const reposts = posts.map((m) => m.forwards || 0);
 
   const avgViews = avg(views);
   const avgReactions = avg(reactions);
-  const avgForwards = avg(forwards);
+  const avgComments = avg(comments);
+  const avgReposts = avg(reposts);
 
-  const erViews = subscribers ? (avgViews / subscribers) * 100 : 0;
-  const erActions = subscribers ? ((avgReactions + avgForwards) / subscribers) * 100 : 0;
+  const totalViews = sum(views);
+  const totalReactions = sum(reactions);
+  const totalComments = sum(comments);
+  const totalReposts = sum(reposts);
 
-  console.log(`OK: ${channelUsername}`);
+  const postErViews = pct(avgViews, subscribers);
+  const postErActivities = pct(avgReactions + avgComments + avgReposts, subscribers);
 
-  return { subscribers, avgViews, avgReactions, avgForwards, erViews, erActions, postsCount: validPosts.length };
-}
+  const engagementPerPost = posts.length
+    ? Number(((totalReactions + totalComments + totalReposts) / posts.length).toFixed(2))
+    : 0;
 
-function avg(arr) {
-  return arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : 0;
-}
+  const reactionsPer1000Views = totalViews ? Number(((totalReactions / totalViews) * 1000).toFixed(2)) : 0;
+  const repostsPer1000Views = totalViews ? Number(((totalReposts / totalViews) * 1000).toFixed(2)) : 0;
+  const commentsPer1000Views = totalViews ? Number(((totalComments / totalViews) * 1000).toFixed(2)) : 0;
+  const viralityPct = totalViews ? Number(((totalReposts / totalViews) * 100).toFixed(2)) : 0;
+  const contentQualityIndex = Number(((postErViews * 0.6) + (postErActivities * 0.4)).toFixed(2));
 
-function getWeekRange() {
-  const now = new Date();
-  const day = now.getDay();
-  const diff = day === 0 ? -6 : 1 - day;
-
-  const monday = new Date(now);
-  monday.setDate(now.getDate() + diff - 7);
-
-  const sunday = new Date(monday);
-  sunday.setDate(monday.getDate() + 6);
+  console.log(`OK: ${channelRef}`);
 
   return {
-    start: monday.toISOString().slice(0, 10),
-    end: sunday.toISOString().slice(0, 10)
+    subscribers,
+    avgReachPost: avgViews,
+    avgViewsPost: avgViews,
+    postErViews,
+    postErActivities,
+    avgReactionsPost: avgReactions,
+    avgCommentsPost: avgComments,
+    avgRepostsPost: avgReposts,
+    postsCount: posts.length,
+    avgReachStory: 0,
+    avgViewsStory: 0,
+    storyErViews: 0,
+    storyErActivities: 0,
+    storiesCount: 0,
+    enabledNotificationsPct: 0,
+    totalViews,
+    totalReactions,
+    totalComments,
+    totalReposts,
+    engagementPerPost,
+    reactionsPer1000Views,
+    repostsPer1000Views,
+    commentsPer1000Views,
+    viralityPct,
+    contentQualityIndex
   };
 }
 
-async function main() {
-  const client = await initTelegram();
-  const sheets = await initGoogleSheets();
-
-  const channels = process.env.CHANNELS.split(",").map(c => c.trim());
-  const week = getWeekRange();
-
-  const rows = [];
-
-  for (const channel of channels) {
-    const s = await getChannelStats(client, channel);
-    rows.push([
-      week.start, week.end, channel,
-      s.subscribers, s.avgViews, s.avgViews,
-      Number(s.erViews.toFixed(2)),
-      Number(s.erActions.toFixed(2)),
-      s.avgReactions, 0, s.avgForwards,
-      s.postsCount, 0,0,0,0,0,0
-    ]);
-  }
-
-  await appendToGoogleSheet(sheets, rows);
-  console.log("Готово.");
+function toRow(channelRef, range, s) {
+  return [
+    range.startStr,
+    range.endStr,
+    channelRef,
+    s.subscribers,
+    s.avgReachPost,
+    s.avgViewsPost,
+    s.postErViews,
+    s.postErActivities,
+    s.avgReactionsPost,
+    s.avgCommentsPost,
+    s.avgRepostsPost,
+    s.postsCount,
+    s.avgReachStory,
+    s.avgViewsStory,
+    s.storyErViews,
+    s.storyErActivities,
+    s.storiesCount,
+    s.enabledNotificationsPct,
+    s.totalViews,
+    s.totalReactions,
+    s.totalComments,
+    s.totalReposts,
+    s.engagementPerPost,
+    s.reactionsPer1000Views,
+    s.repostsPer1000Views,
+    s.commentsPer1000Views,
+    s.viralityPct,
+    s.contentQualityIndex
+  ];
 }
 
-main().catch(console.error);
+async function main() {
+  const channels = (process.env.CHANNELS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (!channels.length) {
+    throw new Error("Не задан CHANNELS");
+  }
+
+  console.log("START REPORT");
+
+  const client = await initTelegram();
+  const sheets = await initGoogleSheets();
+  const range = weekRange();
+
+  const rows = [];
+  for (const channel of channels) {
+    const stats = await getChannelStats(client, channel, range);
+    rows.push(toRow(channel, range, stats));
+  }
+
+  await ensureSheetHeader(sheets);
+  await appendRows(sheets, rows);
+
+  await client.disconnect();
+  console.log("END REPORT");
+}
+
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});

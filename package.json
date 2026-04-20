@@ -1,18 +1,13 @@
 {
   "name": "tg-weekly-stats",
-  "version": "1.0.0",
-  "description": "Weekly Telegram channel analytics to Google Sheets and XLSX",
-  "main": "src/weeklyReport.js",
+  "version": "1.2.0",
   "type": "commonjs",
   "scripts": {
-    "session": "node src/createSession.js",
     "report": "node src/weeklyReport.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
-    "exceljs": "^4.4.0",
     "googleapis": "^150.0.1",
-    "input": "^1.0.1",
     "telegram": "^2.26.22"
   }
 }
