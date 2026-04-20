@@ -4,6 +4,8 @@ const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { google } = require("googleapis");
 
+const TZ_OFFSET_HOURS = Number(process.env.TZ_OFFSET_HOURS || 3); // Москва по умолчанию
+
 function avg(arr, digits = 2) {
   if (!arr.length) return 0;
   return Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(digits));
@@ -18,38 +20,45 @@ function pct(part, total, digits = 2) {
   return Number(((part / total) * 100).toFixed(digits));
 }
 
-// Прошлая завершённая неделя: Пн 00:00:00 UTC -> след. Пн 00:00:00 UTC (не включая правую границу)
-function weekRange() {
-  const now = new Date();
+function shiftToLocal(date) {
+  return new Date(date.getTime() + TZ_OFFSET_HOURS * 60 * 60 * 1000);
+}
 
-  const utcToday = new Date(Date.UTC(
-    now.getUTCFullYear(),
-    now.getUTCMonth(),
-    now.getUTCDate(),
+function ymd(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+// Прошлая завершённая неделя в локальной зоне с фиксированным offset:
+// Пн..Вс
+function weekRangeLocal() {
+  const nowUtc = new Date();
+  const nowLocal = shiftToLocal(nowUtc);
+
+  const localMidnight = new Date(Date.UTC(
+    nowLocal.getUTCFullYear(),
+    nowLocal.getUTCMonth(),
+    nowLocal.getUTCDate(),
     0, 0, 0, 0
   ));
 
-  const day = utcToday.getUTCDay(); // 0=Sun ... 6=Sat
+  const day = localMidnight.getUTCDay(); // 0=Sun..6=Sat
   const daysSinceMonday = (day + 6) % 7;
 
-  const currentMonday = new Date(utcToday);
-  currentMonday.setUTCDate(utcToday.getUTCDate() - daysSinceMonday);
+  const currentMondayLocal = new Date(localMidnight);
+  currentMondayLocal.setUTCDate(localMidnight.getUTCDate() - daysSinceMonday);
 
-  const start = new Date(currentMonday);
-  start.setUTCDate(currentMonday.getUTCDate() - 7);
-  start.setUTCHours(0, 0, 0, 0);
+  const startLocal = new Date(currentMondayLocal);
+  startLocal.setUTCDate(currentMondayLocal.getUTCDate() - 7);
 
-  const endExclusive = new Date(currentMonday);
-  endExclusive.setUTCHours(0, 0, 0, 0);
+  const endExclusiveLocal = new Date(currentMondayLocal);
 
-  const endDisplay = new Date(endExclusive);
-  endDisplay.setUTCDate(endExclusive.getUTCDate() - 1);
+  const endDisplayLocal = new Date(endExclusiveLocal);
+  endDisplayLocal.setUTCDate(endExclusiveLocal.getUTCDate() - 1);
 
   return {
-    start,
-    endExclusive,
-    startStr: start.toISOString().slice(0, 10),
-    endStr: endDisplay.toISOString().slice(0, 10)
+    startStr: ymd(startLocal),
+    endStr: ymd(endDisplayLocal),
+    endExclusiveStr: ymd(endExclusiveLocal)
   };
 }
 
@@ -61,10 +70,16 @@ function commentsCount(message) {
   return message?.replies?.replies || 0;
 }
 
-function messageDateToDate(msg) {
-  if (!msg?.date) return null;
-  if (msg.date instanceof Date) return msg.date;
-  return new Date(msg.date);
+function toDate(message) {
+  if (!message?.date) return null;
+  if (message.date instanceof Date) return message.date;
+  return new Date(message.date);
+}
+
+function localDateStr(message) {
+  const dt = toDate(message);
+  if (!dt || Number.isNaN(dt.getTime())) return "";
+  return ymd(shiftToLocal(dt));
 }
 
 async function initTelegram() {
@@ -146,16 +161,12 @@ async function ensureSheetHeader(sheets) {
     range: "weekly_stats!A1:A1"
   });
 
-  const isEmpty = !existing.data.values || existing.data.values.length === 0;
-
-  if (isEmpty) {
+  if (!existing.data.values || existing.data.values.length === 0) {
     await sheets.spreadsheets.values.update({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
       range: "weekly_stats!A1:AD1",
       valueInputOption: "RAW",
-      requestBody: {
-        values: [header]
-      }
+      requestBody: { values: [header] }
     });
   }
 }
@@ -166,15 +177,13 @@ async function appendRows(sheets, rows) {
     range: "weekly_stats!A2",
     valueInputOption: "RAW",
     insertDataOption: "INSERT_ROWS",
-    requestBody: {
-      values: rows
-    }
+    requestBody: { values: rows }
   });
 }
 
 async function getChannelStats(client, channelRef, range) {
   console.log(`Собираю: ${channelRef}`);
-  console.log(`WEEK RANGE: ${range.start.toISOString()} -> ${range.endExclusive.toISOString()} (exclusive)`);
+  console.log(`LOCAL WEEK RANGE: ${range.startStr} -> ${range.endStr} (TZ offset ${TZ_OFFSET_HOURS})`);
 
   const entity = await client.getEntity(channelRef);
   const full = await client.invoke(new Api.channels.GetFullChannel({ channel: entity }));
@@ -182,28 +191,35 @@ async function getChannelStats(client, channelRef, range) {
   const subscribers =
     full?.fullChat?.participantsCount ||
     full?.fullChat?.participants_count ||
+    full?.chats?.[0]?.participantsCount ||
     0;
 
-  // Берём большой диапазон сообщений и фильтруем по реальным датам.
-  // Без break, чтобы не потерять посты из-за неожиданных структур/дат.
   const raw = await client.getMessages(entity, { limit: 1000 });
 
-  const posts = raw.filter((m) => {
-    const dt = messageDateToDate(m);
-    if (!dt || Number.isNaN(dt.getTime())) return false;
+  const candidateDates = raw
+    .map((m) => localDateStr(m))
+    .filter(Boolean)
+    .slice(0, 10);
 
-    const inWeek = dt >= range.start && dt < range.endExclusive;
+  console.log("TOP MESSAGE LOCAL DATES:", candidateDates.join(", "));
+
+  const posts = raw.filter((m) => {
+    const d = localDateStr(m);
+    if (!d) return false;
+
+    const inWeek = d >= range.startStr && d <= range.endStr;
     if (!inWeek) return false;
 
     const hasMetrics = (m?.views || 0) > 0 || (m?.forwards || 0) > 0 || reactionsCount(m) > 0;
     const hasContent = Boolean(m?.message || m?.media);
+
     return !m?.action && (m?.post === true || hasMetrics || hasContent);
   });
 
   console.log(`POSTS FOUND: ${posts.length}`);
 
-  const newestPostDate = posts[0]?.date ? messageDateToDate(posts[0]).toISOString() : "";
-  const oldestPostDate = posts[posts.length - 1]?.date ? messageDateToDate(posts[posts.length - 1]).toISOString() : "";
+  const newestPostDate = posts[0]?.date ? localDateStr(posts[0]) : "";
+  const oldestPostDate = posts[posts.length - 1]?.date ? localDateStr(posts[posts.length - 1]) : "";
 
   const views = posts.map((m) => m.views || 0);
   const reactions = posts.map(reactionsCount);
@@ -245,14 +261,12 @@ async function getChannelStats(client, channelRef, range) {
     avgCommentsPost: avgComments,
     avgRepostsPost: avgReposts,
     postsCount: posts.length,
-
     avgReachStory: 0,
     avgViewsStory: 0,
     storyErViews: 0,
     storyErActivities: 0,
     storiesCount: 0,
     enabledNotificationsPct: 0,
-
     totalViews,
     totalReactions,
     totalComments,
@@ -317,7 +331,7 @@ async function main() {
 
   const client = await initTelegram();
   const sheets = await initGoogleSheets();
-  const range = weekRange();
+  const range = weekRangeLocal();
 
   const rows = [];
   for (const channel of channels) {
