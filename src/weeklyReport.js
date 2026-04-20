@@ -161,17 +161,19 @@ async function getChannelStats(client, channelRef, range) {
   const subscribers = full?.fullChat?.participantsCount || 0;
 
   const posts = [];
-  for await (const msg of client.iterMessages(entity, { limit: 300 })) {
+  for await (const msg of client.iterMessages(entity, { limit: 500 })) {
     if (!msg?.date) continue;
+
     const dt = new Date(msg.date);
 
-    if (dt < range.start) break;
-    if (dt > range.end) continue;
-    if (msg.post !== true) continue;
-    if (msg.action) continue;
-
-    posts.push(msg);
+    if (dt >= range.start && dt <= range.end) {
+      if (msg.post === true && !msg.action) {
+        posts.push(msg);
+      }
+    }
   }
+
+  console.log(`POSTS FOUND: ${posts.length}`);
 
   const views = posts.map((m) => m.views || 0);
   const reactions = posts.map(reactionsCount);
