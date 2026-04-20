@@ -1,146 +1,172 @@
 
-// FULL PRO VERSION WITH STORIES (READY FOR GITHUB)
+// FIXED FULL PRO WITH STORIES + HEADERS + POSTS_RAW
 
 require("dotenv").config();
-
 const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { google } = require("googleapis");
 
-// ===== HELPERS =====
-const avg = (a) => a.length ? a.reduce((x,y)=>x+y,0)/a.length : 0;
-const sum = (a) => a.reduce((x,y)=>x+y,0);
-const pct = (a,b) => b ? (a/b)*100 : 0;
+const avg = (a)=>a.length? a.reduce((x,y)=>x+y,0)/a.length:0;
+const sum = (a)=>a.reduce((x,y)=>x+y,0);
+const pct = (a,b)=>b?(a/b)*100:0;
 
-const toDate = (m) => {
-  if (!m?.date) return null;
-  return typeof m.date === "number" ? new Date(m.date * 1000) : new Date(m.date);
-};
-
-// ===== STORIES =====
-async function getStoriesStats(client, channel) {
-  try {
-    const res = await client.invoke(
-      new Api.stories.GetPeerStories({ peer: channel })
-    );
-
-    const stories = res.stories?.stories || [];
-
-    const views = stories.map(s => s.views?.views_count || 0);
-    const reactions = stories.map(s =>
-      (s.views?.reactions?.results || []).reduce((a,r)=>a+r.count,0)
-    );
-    const forwards = stories.map(s => s.views?.forwards_count || 0);
-
-    const totalViews = sum(views);
-    const totalActions = sum(reactions) + sum(forwards);
-
-    return {
-      count: stories.length,
-      avgViews: Math.round(avg(views)),
-      avgActions: Math.round(avg(reactions.map((r,i)=>r+forwards[i]))),
-      erViews: pct(avg(views), totalViews).toFixed(2),
-      erActions: pct(totalActions, totalViews).toFixed(2)
-    };
-
-  } catch(e) {
-    console.log("Stories error:", e.message);
-    return { count:0, avgViews:0, avgActions:0, erViews:0, erActions:0 };
-  }
-}
-
-// ===== MAIN =====
-async function main() {
-  console.log("PRO + STORIES START");
-
-  const client = new TelegramClient(
+async function tg(){
+  const c=new TelegramClient(
     new StringSession(process.env.TG_STRING_SESSION),
     Number(process.env.TG_API_ID),
     process.env.TG_API_HASH,
-    { connectionRetries: 5 }
+    {connectionRetries:5}
   );
+  await c.connect();
+  return c;
+}
 
-  await client.connect();
-
-  const auth = new google.auth.JWT({
-    email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
-    key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, "\n"),
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+async function sheets(){
+  const auth=new google.auth.JWT({
+    email:process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+    key:process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g,"\n"),
+    scopes:["https://www.googleapis.com/auth/spreadsheets"]
   });
-
   await auth.authorize();
+  return google.sheets({version:"v4",auth});
+}
 
-  const sheets = google.sheets({ version: "v4", auth });
+async function ensureHeaders(s){
+  const weeklyHeader=[[
+    "Дата","Канал","Подписчики","Ср просмотры",
+    "ER просмотры %","ER активности %",
+    "Ср реакции","Ср комментарии","Ср репосты","Посты",
+    "Сторис кол-во","Сторис ср просмотры","Сторис ср активность","ER сторис просмотры","ER сторис активности"
+  ]];
 
-  const channels = process.env.CHANNELS.split(",");
+  const rawHeader=[[
+    "Дата","Канал","ID","Текст","Просмотры","Реакции","Комментарии","Репосты"
+  ]];
 
-  for (const ch of channels) {
-    console.log("CHANNEL:", ch);
+  try{
+    const r=await s.spreadsheets.values.get({
+      spreadsheetId:process.env.GOOGLE_SHEET_ID,
+      range:"weekly_stats!A1"
+    });
+    if(!r.data.values){
+      await s.spreadsheets.values.update({
+        spreadsheetId:process.env.GOOGLE_SHEET_ID,
+        range:"weekly_stats!A1",
+        valueInputOption:"RAW",
+        requestBody:{values:weeklyHeader}
+      });
+    }
+  }catch{}
 
-    const entity = await client.getEntity(ch);
+  try{
+    const r2=await s.spreadsheets.values.get({
+      spreadsheetId:process.env.GOOGLE_SHEET_ID,
+      range:"posts_raw!A1"
+    });
+    if(!r2.data.values){
+      await s.spreadsheets.values.update({
+        spreadsheetId:process.env.GOOGLE_SHEET_ID,
+        range:"posts_raw!A1",
+        valueInputOption:"RAW",
+        requestBody:{values:rawHeader}
+      });
+    }
+  }catch{}
+}
 
-    const full = await client.invoke(
-      new Api.channels.GetFullChannel({ channel: entity })
-    );
+async function getStories(client, entity){
+  try{
+    const res=await client.invoke(new Api.stories.GetPeerStories({peer:entity}));
+    const s=res.stories?.stories||[];
 
-    const subs = full.fullChat.participantsCount || 0;
+    const views=s.map(x=>x.views?.views_count||0);
+    const reacts=s.map(x=>(x.views?.reactions?.results||[]).reduce((a,r)=>a+r.count,0));
+    const fw=s.map(x=>x.views?.forwards_count||0);
 
-    const msgs = await client.getMessages(entity, { limit: 200 });
+    return {
+      count:s.length,
+      avgViews:Math.round(avg(views)),
+      avgAct:Math.round(avg(reacts.map((r,i)=>r+fw[i]))),
+      erViews:pct(avg(views),sum(views)).toFixed(2),
+      erAct:pct(sum(reacts)+sum(fw),sum(views)).toFixed(2)
+    };
+  }catch(e){
+    return {count:0,avgViews:0,avgAct:0,erViews:0,erAct:0};
+  }
+}
 
-    const posts = msgs.filter(m => !m.action);
+async function main(){
+  console.log("FIX START");
 
-    console.log("POSTS:", posts.length);
+  const client=await tg();
+  const s=await sheets();
 
-    const views = posts.map(m=>m.views||0);
-    const reactions = posts.map(m=>
-      (m.reactions?.results||[]).reduce((a,r)=>a+r.count,0)
-    );
-    const comments = posts.map(m=>m.replies?.replies||0);
-    const forwards = posts.map(m=>m.forwards||0);
+  await ensureHeaders(s);
 
-    const avgViews = Math.round(avg(views));
-    const avgReact = Math.round(avg(reactions));
-    const avgComm = Math.round(avg(comments));
-    const avgForw = Math.round(avg(forwards));
+  const chs=process.env.CHANNELS.split(",");
 
-    const erViews = pct(avgViews, subs).toFixed(2);
-    const erActions = pct(avgReact+avgComm+avgForw, avgViews).toFixed(2);
+  for(const ch of chs){
+    const entity=await client.getEntity(ch);
 
-    // ===== STORIES =====
-    const stories = await getStoriesStats(client, entity);
+    const full=await client.invoke(new Api.channels.GetFullChannel({channel:entity}));
+    const subs=full.fullChat.participantsCount||0;
 
-    const row = [[
-      new Date().toISOString().slice(0,10),
-      ch,
-      subs,
-      avgViews,
-      erViews,
-      erActions,
-      avgReact,
-      avgComm,
-      avgForw,
-      posts.length,
+    const msgs=await client.getMessages(entity,{limit:200});
+    const posts=msgs.filter(m=>!m.action);
 
-      // STORIES
-      stories.count,
-      stories.avgViews,
-      stories.avgActions,
-      stories.erViews,
-      stories.erActions
-    ]];
+    const views=posts.map(m=>m.views||0);
+    const reacts=posts.map(m=>(m.reactions?.results||[]).reduce((a,r)=>a+r.count,0));
+    const comm=posts.map(m=>m.replies?.replies||0);
+    const fw=posts.map(m=>m.forwards||0);
 
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: "weekly_stats!A1",
-      valueInputOption: "RAW",
-      requestBody: { values: row }
+    const avgViews=Math.round(avg(views));
+    const avgR=Math.round(avg(reacts));
+    const avgC=Math.round(avg(comm));
+    const avgF=Math.round(avg(fw));
+
+    const erV=pct(avgViews,subs).toFixed(2);
+    const erA=pct(avgR+avgC+avgF,avgViews).toFixed(2);
+
+    const stories=await getStories(client,entity);
+
+    // weekly
+    await s.spreadsheets.values.append({
+      spreadsheetId:process.env.GOOGLE_SHEET_ID,
+      range:"weekly_stats!A2",
+      valueInputOption:"RAW",
+      requestBody:{values:[[
+        new Date().toISOString().slice(0,10),
+        ch,subs,avgViews,erV,erA,avgR,avgC,avgF,posts.length,
+        stories.count,stories.avgViews,stories.avgAct,stories.erViews,stories.erAct
+      ]]}
     });
 
-    console.log("DONE:", ch);
+    // posts_raw
+    const raw=posts.map(m=>[
+      new Date().toISOString().slice(0,10),
+      ch,
+      m.id,
+      (m.message||"").slice(0,100),
+      m.views||0,
+      (m.reactions?.results||[]).reduce((a,r)=>a+r.count,0),
+      m.replies?.replies||0,
+      m.forwards||0
+    ]);
+
+    if(raw.length){
+      await s.spreadsheets.values.append({
+        spreadsheetId:process.env.GOOGLE_SHEET_ID,
+        range:"posts_raw!A2",
+        valueInputOption:"RAW",
+        requestBody:{values:raw}
+      });
+    }
+
+    console.log("OK:",ch,"POSTS:",posts.length);
   }
 
   await client.disconnect();
-  console.log("PRO + STORIES DONE");
+  console.log("FIX DONE");
 }
 
 main();
