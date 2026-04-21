@@ -256,6 +256,7 @@ async function stats(client, ch, range) {
   });
 
   return {
+    entity: e,
     subs, avgViews, medViews, erV, erA, avgR, avgC, avgF,
     count: posts.length, tV, eng, eng1000, vir, vIndex, quality,
     best: Math.max(...views, 0), worst: views.length ? Math.min(...views) : 0,
@@ -273,43 +274,41 @@ async function getStoriesStats(client, entity) {
     );
 
     const stories = res?.stories?.stories || [];
-    const viewsArr = stories.map(s => {
+    const count = stories.length;
+
+    const storyViews = stories.map(s => {
       const v = s?.views;
       return v?.viewsCount || v?.views_count || 0;
     });
 
-    const reactionsArr = stories.map(s => {
+    const storyForwards = stories.map(s => {
+      const v = s?.views;
+      return v?.forwardsCount || v?.forwards_count || 0;
+    });
+
+    const storyReactions = stories.map(s => {
       const v = s?.views;
       const rx = v?.reactions?.results || [];
       return rx.reduce((a, r) => a + (r.count || 0), 0);
     });
 
-    const forwardsArr = stories.map(s => {
-      const v = s?.views;
-      return v?.forwardsCount || v?.forwards_count || 0;
-    });
-
-    const actionsArr = reactionsArr.map((r, i) => r + (forwardsArr[i] || 0));
+    const avgViews = count ? Number((storyViews.reduce((a, b) => a + b, 0) / count).toFixed(2)) : 0;
+    const avgActions = count ? Number((storyReactions.reduce((a, b) => a + b, 0) + storyForwards.reduce((a, b) => a + b, 0)) / count).toFixed(2) : 0;
+    const erStories = avgViews ? Number(((avgActions / avgViews) * 100).toFixed(2)) : 0;
 
     let topStory = "";
     if (stories.length) {
-      const indexed = stories.map((s, i) => ({ story: s, idx: i, views: viewsArr[i] || 0 }));
-      const best = indexed.reduce((max, cur) => cur.views > max.views ? cur : max, indexed[0]);
-      const storyDate = best.story?.date
-        ? (typeof best.story.date === "number"
-            ? new Date(best.story.date * 1000)
-            : new Date(best.story.date))
+      const bestIndex = storyViews.reduce((best, v, i, arr) => v > arr[best] ? i : best, 0);
+      const best = stories[bestIndex];
+      const bestDate = best?.date
+        ? (typeof best.date === "number" ? new Date(best.date * 1000) : new Date(best.date))
         : null;
-      const storyId = best.story?.id ?? "";
-      topStory = storyDate && !Number.isNaN(storyDate.getTime())
-        ? `${storyDate.toISOString()} | id:${storyId} | views:${best.views}`
-        : `id:${storyId} | views:${best.views}`;
+      const bestId = best?.id ?? "";
+      const bestViews = storyViews[bestIndex] || 0;
+      topStory = bestDate && !Number.isNaN(bestDate.getTime())
+        ? `${bestDate.toISOString()} | id:${bestId} | views:${bestViews}`
+        : `id:${bestId} | views:${bestViews}`;
     }
-
-    const count = stories.length;
-    const avgViews = count ? Number((viewsArr.reduce((a, b) => a + b, 0) / count).toFixed(2)) : 0;
-    const avgActions = count ? Number((actionsArr.reduce((a, b) => a + b, 0) / count).toFixed(2)) : 0;
-    const erStories = avgViews ? Number(((avgActions / avgViews) * 100).toFixed(2)) : 0;
 
     return { count, avgViews, erStories, topStory };
   } catch (e) {
@@ -318,7 +317,7 @@ async function getStoriesStats(client, entity) {
   }
 }
 
-async function appendStories(s, rows) {
+async function appendStoriesWeekly(s, rows) {
   if (!rows.length) return;
   await s.spreadsheets.values.append({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
@@ -366,10 +365,10 @@ async function main() {
 
     const prev = await prevRow(s, ch);
     const m = await stats(c, ch, range);
-    const storiesStats = await getStoriesStats(c, m.entity);
+    const stories = await getStoriesStats(c, m.entity);
 
     console.log("POSTS FOUND:", m.count);
-    console.log("STORIES FOUND:", storiesStats.count);
+    console.log("STORIES FOUND:", stories.count);
 
     const dSubs = delta(m.subs, prev?.subs);
     const dSubsPct = deltaPct(m.subs, prev?.subs);
@@ -408,20 +407,21 @@ async function main() {
     ]);
 
     rawRows.push(...m.rawRows);
+
     storiesRows.push([
       range.startStr,
       range.endStr,
       ch,
-      storiesStats.count,
-      storiesStats.avgViews,
-      storiesStats.erStories,
-      storiesStats.topStory
+      stories.count,
+      stories.avgViews,
+      stories.erStories,
+      stories.topStory
     ]);
   }
 
   await appendWeekly(s, weeklyRows);
   await appendRaw(s, rawRows);
-  await appendStories(s, storiesRows);
+  await appendStoriesWeekly(s, storiesRows);
 
   await c.disconnect();
   console.log("FINAL PRO + RECO DONE");
