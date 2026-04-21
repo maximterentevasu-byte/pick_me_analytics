@@ -4,6 +4,8 @@ const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { google } = require("googleapis");
 
+const TZ_OFFSET_HOURS = Number(process.env.TZ_OFFSET_HOURS || 3);
+
 const avg = (a, d = 2) => a.length ? Number((a.reduce((x, y) => x + y, 0) / a.length).toFixed(d)) : 0;
 const sum = (a) => a.reduce((x, y) => x + y, 0);
 const pct = (a, b, d = 2) => b ? Number(((a / b) * 100).toFixed(d)) : 0;
@@ -13,23 +15,55 @@ const median = (a) => {
   const m = Math.floor(s.length / 2);
   return s.length % 2 ? s[m] : Number(((s[m - 1] + s[m]) / 2).toFixed(2));
 };
-const toDate = (m) => !m?.date ? null : (typeof m.date === "number" ? new Date(m.date * 1000) : new Date(m.date));
 const delta = (c, p) => (p === "" || p == null) ? "" : Number((Number(c) - Number(p)).toFixed(2));
 const deltaPct = (c, p) => (p === "" || p == null || Number(p) === 0) ? "" : Number((((Number(c) - Number(p)) / Number(p)) * 100).toFixed(2));
 
-function weekRange() {
-  const now = new Date();
-  const d = (now.getDay() + 6) % 7;
-  const mon = new Date(now);
-  mon.setDate(now.getDate() - d);
-  mon.setHours(0, 0, 0, 0);
-  const start = new Date(mon);
-  start.setDate(mon.getDate() - 7);
+function shiftToLocal(date) {
+  return new Date(date.getTime() + TZ_OFFSET_HOURS * 60 * 60 * 1000);
+}
+function ymd(date) {
+  return date.toISOString().slice(0, 10);
+}
+function toDate(m) {
+  if (!m?.date) return null;
+  if (typeof m.date === "number") return new Date(m.date * 1000);
+  if (m.date instanceof Date) return m.date;
+  return new Date(m.date);
+}
+function localDateStr(m) {
+  const d = toDate(m);
+  if (!d || Number.isNaN(d.getTime())) return "";
+  return ymd(shiftToLocal(d));
+}
+
+function weekRangeLocal() {
+  const nowUtc = new Date();
+  const nowLocal = shiftToLocal(nowUtc);
+
+  const localMidnight = new Date(Date.UTC(
+    nowLocal.getUTCFullYear(),
+    nowLocal.getUTCMonth(),
+    nowLocal.getUTCDate(),
+    0, 0, 0, 0
+  ));
+
+  const day = localMidnight.getUTCDay(); // 0=Sun..6=Sat
+  const daysSinceMonday = (day + 6) % 7;
+
+  const currentMondayLocal = new Date(localMidnight);
+  currentMondayLocal.setUTCDate(localMidnight.getUTCDate() - daysSinceMonday);
+
+  const startLocal = new Date(currentMondayLocal);
+  startLocal.setUTCDate(currentMondayLocal.getUTCDate() - 7);
+
+  const endExclusiveLocal = new Date(currentMondayLocal);
+
+  const endDisplayLocal = new Date(endExclusiveLocal);
+  endDisplayLocal.setUTCDate(endExclusiveLocal.getUTCDate() - 1);
+
   return {
-    start,
-    end: mon,
-    startStr: start.toISOString().slice(0, 10),
-    endStr: new Date(mon - 86400000).toISOString().slice(0, 10)
+    startStr: ymd(startLocal),
+    endStr: ymd(endDisplayLocal)
   };
 }
 
@@ -208,10 +242,16 @@ async function stats(client, ch, range) {
   const subs = f?.fullChat?.participantsCount || 0;
 
   const raw = await client.getMessages(e, { limit: 1000 });
+
+  // ФИНАЛЬНЫЙ УСТОЙЧИВЫЙ WEEKLY-ФИЛЬТР:
   const posts = raw.filter(m => {
-    const d = toDate(m);
-    return d && d >= range.start && d < range.end && !m.action;
+    if (m?.action) return false;
+    const d = localDateStr(m);
+    if (!d) return false;
+    return d >= range.startStr && d <= range.endStr;
   });
+
+  console.log("TOP DATES:", raw.slice(0, 10).map(localDateStr).filter(Boolean).join(", "));
 
   const views = posts.map(m => m.views || 0);
   const reacts = posts.map(reactions);
@@ -294,12 +334,14 @@ async function appendStories(s, rows) {
 }
 
 async function main() {
-  console.log("STEP4 MERGED + STORIES");
+  console.log("STEP4 MERGED + STORIES + FINAL WEEKLY FILTER");
 
   const c = await tg();
   const s = await sheets();
-  const range = weekRange();
+  const range = weekRangeLocal();
   const chs = process.env.CHANNELS.split(",").map(x => x.trim()).filter(Boolean);
+
+  console.log(`WEEK: ${range.startStr} -> ${range.endStr} (TZ ${TZ_OFFSET_HOURS})`);
 
   await ensureHeaders(s);
 
@@ -368,7 +410,7 @@ async function main() {
   await appendStories(s, storiesRows);
 
   await c.disconnect();
-  console.log("STEP4 MERGED + STORIES DONE");
+  console.log("STEP4 MERGED + STORIES + FINAL WEEKLY FILTER DONE");
 }
 
 main().catch(e => {
