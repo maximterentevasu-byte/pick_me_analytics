@@ -116,7 +116,7 @@ async function sheets() {
 async function ensureHeaders(s) {
   const weeklyHeader = [[
     "Дата начала недели","Дата конца недели","Канал","Подписчики",
-    "Средний просмотр","Медианный просмотр",
+    "Средний просмотр","Доля пользователей с включёнными уведомлениями %","Медианный просмотр",
     "ER (просмотры)%","ER (активности)%",
     "Ср реакции","Ср комментарии","Ср репосты",
     "Посты","Просмотры сумма",
@@ -389,7 +389,7 @@ async function main() {
 
     weeklyRows.push([
       range.startStr, range.endStr, ch, m.subs,
-      m.avgViews, m.medViews,
+      m.avgViews, "", m.medViews,
       m.erV, m.erA,
       m.avgR, m.avgC, m.avgF,
       m.count, m.tV,
