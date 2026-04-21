@@ -140,10 +140,6 @@ async function ensureHeaders(s) {
     "ER поста %","Виральность поста %"
   ]];
 
-  const storiesHeader = [[
-    "Дата начала недели","Дата конца недели","Канал","Количество сторис"
-  ]];
-
   const resWeekly = await s.spreadsheets.values.get({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
     range: "weekly_stats!A1:A1"
@@ -169,20 +165,6 @@ async function ensureHeaders(s) {
       range: "posts_raw!A1",
       valueInputOption: "RAW",
       requestBody: { values: rawHeader }
-    });
-  }
-
-  const resStories = await s.spreadsheets.values.get({
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: "stories_weekly!A1:A1"
-  }).catch(() => ({ data: {} }));
-
-  if (!resStories.data.values || resStories.data.values.length === 0) {
-    await s.spreadsheets.values.update({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: "stories_weekly!A1",
-      valueInputOption: "RAW",
-      requestBody: { values: storiesHeader }
     });
   }
 }
@@ -255,7 +237,6 @@ async function stats(client, ch, range) {
   });
 
   return {
-    entity: e,
     subs, avgViews, medViews, erV, erA, avgR, avgC, avgF,
     count: posts.length, tV, eng, eng1000, vir, vIndex, quality,
     best: Math.max(...views, 0), worst: views.length ? Math.min(...views) : 0,
@@ -263,18 +244,68 @@ async function stats(client, ch, range) {
   };
 }
 
-async function getStoriesCount(client, entity) {
+async function getStoriesStats(client, entity) {
   try {
     const res = await client.invoke(
       new Api.stories.GetPeerStories({
         peer: entity
       })
     );
+
     const stories = res?.stories?.stories || [];
-    return stories.length;
+
+    const viewsArr = stories.map(s => {
+      const v = s?.views;
+      return v?.viewsCount || v?.views_count || 0;
+    });
+
+    const reactionsArr = stories.map(s => {
+      const v = s?.views;
+      const rx = v?.reactions?.results || [];
+      return rx.reduce((a, r) => a + (r.count || 0), 0);
+    });
+
+    const forwardsArr = stories.map(s => {
+      const v = s?.views;
+      return v?.forwardsCount || v?.forwards_count || 0;
+    });
+
+    const actionsArr = reactionsArr.map((r, i) => r + (forwardsArr[i] || 0));
+
+    let topStory = "";
+    if (stories.length) {
+      const indexed = stories.map((s, i) => ({ story: s, idx: i, views: viewsArr[i] || 0 }));
+      const best = indexed.reduce((max, cur) => cur.views > max.views ? cur : max, indexed[0]);
+      const storyDate = best.story?.date
+        ? (typeof best.story.date === "number"
+            ? new Date(best.story.date * 1000)
+            : new Date(best.story.date))
+        : null;
+      const storyId = best.story?.id ?? "";
+      topStory = storyDate && !Number.isNaN(storyDate.getTime())
+        ? `${storyDate.toISOString()} | id:${storyId} | views:${best.views}`
+        : `id:${storyId} | views:${best.views}`;
+    }
+
+    const count = stories.length;
+    const avgViews = count ? Number((viewsArr.reduce((a, b) => a + b, 0) / count).toFixed(2)) : 0;
+    const avgActions = count ? Number((actionsArr.reduce((a, b) => a + b, 0) / count).toFixed(2)) : 0;
+    const erStories = avgViews ? Number(((avgActions / avgViews) * 100).toFixed(2)) : 0;
+
+    return {
+      count,
+      avgViews,
+      erStories,
+      topStory
+    };
   } catch (e) {
     console.log("Stories error:", e.message);
-    return 0;
+    return {
+      count: 0,
+      avgViews: 0,
+      erStories: 0,
+      topStory: ""
+    };
   }
 }
 
@@ -297,18 +328,8 @@ async function appendRaw(s, rows) {
   });
 }
 
-async function appendStories(s, rows) {
-  if (!rows.length) return;
-  await s.spreadsheets.values.append({
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: "stories_weekly!A2",
-    valueInputOption: "RAW",
-    requestBody: { values: rows }
-  });
-}
-
 async function main() {
-  console.log("FINAL PRO + RECO + STORIES COUNT");
+  console.log("FINAL PRO + RECO");
 
   const c = await tg();
   const s = await sheets();
@@ -319,17 +340,14 @@ async function main() {
 
   let weeklyRows = [];
   let rawRows = [];
-  let storiesRows = [];
 
   for (const ch of chs) {
     console.log("CHANNEL:", ch);
 
     const prev = await prevRow(s, ch);
     const m = await stats(c, ch, range);
-    const storiesCount = await getStoriesCount(c, m.entity);
 
     console.log("POSTS FOUND:", m.count);
-    console.log("STORIES FOUND:", storiesCount);
 
     const dSubs = delta(m.subs, prev?.subs);
     const dSubsPct = deltaPct(m.subs, prev?.subs);
@@ -368,21 +386,13 @@ async function main() {
     ]);
 
     rawRows.push(...m.rawRows);
-
-    storiesRows.push([
-      range.startStr,
-      range.endStr,
-      ch,
-      storiesCount
-    ]);
   }
 
   await appendWeekly(s, weeklyRows);
   await appendRaw(s, rawRows);
-  await appendStories(s, storiesRows);
 
   await c.disconnect();
-  console.log("FINAL PRO + RECO + STORIES COUNT DONE");
+  console.log("FINAL PRO + RECO DONE");
 }
 
 main().catch(e => {
