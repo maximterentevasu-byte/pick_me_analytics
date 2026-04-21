@@ -33,6 +33,33 @@ function weekRange() {
   };
 }
 
+function startOfWeek(date) {
+  const d = new Date(date);
+  const shift = (d.getDay() + 6) % 7;
+  d.setDate(d.getDate() - shift);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function buildWeekRange(start) {
+  const s = new Date(start);
+  s.setHours(0, 0, 0, 0);
+  const e = new Date(s);
+  e.setDate(s.getDate() + 7);
+  return {
+    start: s,
+    end: e,
+    startStr: s.toISOString().slice(0, 10),
+    endStr: new Date(e.getTime() - 86400000).toISOString().slice(0, 10)
+  };
+}
+
+function addDays(date, days) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+
 const reactions = (m) => (m?.reactions?.results || []).reduce((a, i) => a + (i.count || 0), 0);
 const comments = (m) => m?.replies?.replies || 0;
 
@@ -116,7 +143,7 @@ async function sheets() {
 async function ensureHeaders(s) {
   const weeklyHeader = [[
     "Дата начала недели","Дата конца недели","Канал","Подписчики",
-    "Средний просмотр","Доля пользователей с включёнными уведомлениями %","Медианный просмотр",
+    "Средний просмотр","Медианный просмотр",
     "ER (просмотры)%","ER (активности)%",
     "Ср реакции","Ср комментарии","Ср репосты",
     "Посты","Просмотры сумма",
@@ -138,11 +165,6 @@ async function ensureHeaders(s) {
     "Дата поста","ID поста","Текст поста",
     "Просмотры","Реакции","Комментарии","Репосты",
     "ER поста %","Виральность поста %"
-  ]];
-
-  const storiesHeader = [[
-    "Дата начала недели","Дата конца недели","Канал",
-    "Количество сторис","Средние просмотры сторис","ER сторис","Топ сторис"
   ]];
 
   const resWeekly = await s.spreadsheets.values.get({
@@ -172,47 +194,46 @@ async function ensureHeaders(s) {
       requestBody: { values: rawHeader }
     });
   }
-
-  const resStories = await s.spreadsheets.values.get({
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: "stories_weekly!A1:A1"
-  }).catch(() => ({ data: {} }));
-
-  if (!resStories.data.values || resStories.data.values.length === 0) {
-    await s.spreadsheets.values.update({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: "stories_weekly!A1",
-      valueInputOption: "RAW",
-      requestBody: { values: storiesHeader }
-    });
-  }
 }
 
-async function prevRow(s, ch) {
+async function getAllWeeklyRows(s) {
   const r = await s.spreadsheets.values.get({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
     range: "weekly_stats!A2:AI"
   }).catch(() => ({ data: {} }));
-
-  const rows = r.data.values || [];
-  const f = rows.filter(x => (x[2] || "") === ch);
-  if (!f.length) return null;
-
-  const l = f[f.length - 1];
-  return { subs: l[3], avgViews: l[4], erViews: l[6], erAct: l[7], quality: l[17] };
+  return r.data.values || [];
 }
 
-async function stats(client, ch, range) {
+function getLastMetricsForChannel(rows, ch) {
+  const f = rows.filter(x => (x[2] || "") === ch).sort((a, b) => String(a[1] || "").localeCompare(String(b[1] || "")));
+  if (!f.length) return null;
+  const l = f[f.length - 1];
+  return {
+    endStr: l[1],
+    subs: l[3],
+    avgViews: l[4],
+    erViews: l[6],
+    erAct: l[7],
+    quality: l[17]
+  };
+}
+
+async function loadAllPostsForChannel(client, ch) {
   const e = await client.getEntity(ch);
   const f = await client.invoke(new Api.channels.GetFullChannel({ channel: e }));
   const subs = f?.fullChat?.participantsCount || 0;
 
-  const raw = await client.getMessages(e, { limit: 1000 });
-  const posts = raw.filter(m => {
+  const posts = [];
+  for await (const m of client.iterMessages(e)) {
     const d = toDate(m);
-    return d && d >= range.start && d < range.end && !m.action;
-  });
+    if (d && !m.action) posts.push(m);
+  }
 
+  posts.sort((a, b) => toDate(a) - toDate(b));
+  return { entity: e, subs, posts };
+}
+
+function computeWeekStats(posts, subs, ch, range) {
   const views = posts.map(m => m.views || 0);
   const reacts = posts.map(reactions);
   const comm = posts.map(comments);
@@ -256,7 +277,6 @@ async function stats(client, ch, range) {
   });
 
   return {
-    entity: e,
     subs, avgViews, medViews, erV, erA, avgR, avgC, avgF,
     count: posts.length, tV, eng, eng1000, vir, vIndex, quality,
     best: Math.max(...views, 0), worst: views.length ? Math.min(...views) : 0,
@@ -264,70 +284,8 @@ async function stats(client, ch, range) {
   };
 }
 
-
-async function getStoriesStats(client, entity) {
-  try {
-    const res = await client.invoke(
-      new Api.stories.GetPeerStories({
-        peer: entity
-      })
-    );
-
-    const stories = res?.stories?.stories || [];
-    const count = stories.length;
-
-    const storyViews = stories.map(s => {
-      const v = s?.views;
-      return v?.viewsCount || v?.views_count || 0;
-    });
-
-    const storyForwards = stories.map(s => {
-      const v = s?.views;
-      return v?.forwardsCount || v?.forwards_count || 0;
-    });
-
-    const storyReactions = stories.map(s => {
-      const v = s?.views;
-      const rx = v?.reactions?.results || [];
-      return rx.reduce((a, r) => a + (r.count || 0), 0);
-    });
-
-    const avgViews = count ? Number((storyViews.reduce((a, b) => a + b, 0) / count).toFixed(2)) : 0;
-    const avgActions = count ? Number((storyReactions.reduce((a, b) => a + b, 0) + storyForwards.reduce((a, b) => a + b, 0)) / count).toFixed(2) : 0;
-    const erStories = avgViews ? Number(((avgActions / avgViews) * 100).toFixed(2)) : 0;
-
-    let topStory = "";
-    if (stories.length) {
-      const bestIndex = storyViews.reduce((best, v, i, arr) => v > arr[best] ? i : best, 0);
-      const best = stories[bestIndex];
-      const bestDate = best?.date
-        ? (typeof best.date === "number" ? new Date(best.date * 1000) : new Date(best.date))
-        : null;
-      const bestId = best?.id ?? "";
-      const bestViews = storyViews[bestIndex] || 0;
-      topStory = bestDate && !Number.isNaN(bestDate.getTime())
-        ? `${bestDate.toISOString()} | id:${bestId} | views:${bestViews}`
-        : `id:${bestId} | views:${bestViews}`;
-    }
-
-    return { count, avgViews, erStories, topStory };
-  } catch (e) {
-    console.log("Stories error:", e.message);
-    return { count: 0, avgViews: 0, erStories: 0, topStory: "" };
-  }
-}
-
-async function appendStoriesWeekly(s, rows) {
-  if (!rows.length) return;
-  await s.spreadsheets.values.append({
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: "stories_weekly!A2",
-    valueInputOption: "RAW",
-    requestBody: { values: rows }
-  });
-}
-
 async function appendWeekly(s, rows) {
+  if (!rows.length) return;
   await s.spreadsheets.values.append({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
     range: "weekly_stats!A2",
@@ -347,84 +305,117 @@ async function appendRaw(s, rows) {
 }
 
 async function main() {
-  console.log("FINAL PRO + RECO");
+  console.log("FINAL PRO + RECO BACKFILL+INCREMENTAL");
 
   const c = await tg();
   const s = await sheets();
-  const range = weekRange();
+  const lastCompleted = weekRange();
   const chs = process.env.CHANNELS.split(",").map(x => x.trim()).filter(Boolean);
 
   await ensureHeaders(s);
+  const existingWeeklyRows = await getAllWeeklyRows(s);
 
   let weeklyRows = [];
   let rawRows = [];
-  let storiesRows = [];
 
   for (const ch of chs) {
     console.log("CHANNEL:", ch);
 
-    const prev = await prevRow(s, ch);
-    const m = await stats(c, ch, range);
-    const stories = await getStoriesStats(c, m.entity);
+    const { subs, posts } = await loadAllPostsForChannel(c, ch);
+    console.log("TOTAL POSTS LOADED:", posts.length);
 
-    console.log("POSTS FOUND:", m.count);
-    console.log("STORIES FOUND:", stories.count);
+    if (!posts.length) continue;
 
-    const dSubs = delta(m.subs, prev?.subs);
-    const dSubsPct = deltaPct(m.subs, prev?.subs);
+    const oldestPostDate = toDate(posts[0]);
+    const firstWeekStart = startOfWeek(oldestPostDate);
 
-    const dViews = delta(m.avgViews, prev?.avgViews);
-    const dViewsPct = deltaPct(m.avgViews, prev?.avgViews);
+    const prevExisting = getLastMetricsForChannel(existingWeeklyRows, ch);
 
-    const dErV = delta(m.erV, prev?.erViews);
-    const dErVPct = deltaPct(m.erV, prev?.erViews);
+    let processFrom;
+    if (prevExisting?.endStr) {
+      processFrom = addDays(new Date(prevExisting.endStr + "T00:00:00"), 1);
+    } else {
+      processFrom = firstWeekStart;
+    }
 
-    const dErA = delta(m.erA, prev?.erAct);
-    const dErAPct = deltaPct(m.erA, prev?.erAct);
+    processFrom = startOfWeek(processFrom);
 
-    const dQ = delta(m.quality, prev?.quality);
-    const dQPct = deltaPct(m.quality, prev?.quality);
+    console.log("PROCESS FROM:", processFrom.toISOString().slice(0, 10), "TO:", lastCompleted.startStr);
 
-    const reco = classifyRecommendation(m, prev, m.bestPost, m.worstPost);
+    let prev = prevExisting ? {
+      subs: prevExisting.subs,
+      avgViews: prevExisting.avgViews,
+      erViews: prevExisting.erViews,
+      erAct: prevExisting.erAct,
+      quality: prevExisting.quality
+    } : null;
 
-    weeklyRows.push([
-      range.startStr, range.endStr, ch, m.subs,
-      m.avgViews, "", m.medViews,
-      m.erV, m.erA,
-      m.avgR, m.avgC, m.avgF,
-      m.count, m.tV,
-      m.eng, m.eng1000,
-      m.vir, m.vIndex,
-      m.quality,
-      m.best, m.worst,
-      dSubs, dSubsPct,
-      dViews, dViewsPct,
-      dErV, dErVPct,
-      dErA, dErAPct,
-      dQ, dQPct,
-      reco.status, reco.reason,
-      reco.main, reco.scale, reco.reduce
-    ]);
+    for (let ws = new Date(processFrom); ws < lastCompleted.end; ws = addDays(ws, 7)) {
+      const range = buildWeekRange(ws);
+      if (range.end > lastCompleted.end) break;
 
-    rawRows.push(...m.rawRows);
+      const weekPosts = posts.filter(m => {
+        const d = toDate(m);
+        return d && d >= range.start && d < range.end;
+      });
 
-    storiesRows.push([
-      range.startStr,
-      range.endStr,
-      ch,
-      stories.count,
-      stories.avgViews,
-      stories.erStories,
-      stories.topStory
-    ]);
+      const m = computeWeekStats(weekPosts, subs, ch, range);
+
+      const dSubs = delta(m.subs, prev?.subs);
+      const dSubsPct = deltaPct(m.subs, prev?.subs);
+
+      const dViews = delta(m.avgViews, prev?.avgViews);
+      const dViewsPct = deltaPct(m.avgViews, prev?.avgViews);
+
+      const dErV = delta(m.erV, prev?.erViews);
+      const dErVPct = deltaPct(m.erV, prev?.erViews);
+
+      const dErA = delta(m.erA, prev?.erAct);
+      const dErAPct = deltaPct(m.erA, prev?.erAct);
+
+      const dQ = delta(m.quality, prev?.quality);
+      const dQPct = deltaPct(m.quality, prev?.quality);
+
+      const reco = classifyRecommendation(m, prev, m.bestPost, m.worstPost);
+
+      weeklyRows.push([
+        range.startStr, range.endStr, ch, m.subs,
+        m.avgViews, m.medViews,
+        m.erV, m.erA,
+        m.avgR, m.avgC, m.avgF,
+        m.count, m.tV,
+        m.eng, m.eng1000,
+        m.vir, m.vIndex,
+        m.quality,
+        m.best, m.worst,
+        dSubs, dSubsPct,
+        dViews, dViewsPct,
+        dErV, dErVPct,
+        dErA, dErAPct,
+        dQ, dQPct,
+        reco.status, reco.reason,
+        reco.main, reco.scale, reco.reduce
+      ]);
+
+      rawRows.push(...m.rawRows);
+
+      prev = {
+        subs: m.subs,
+        avgViews: m.avgViews,
+        erViews: m.erV,
+        erAct: m.erA,
+        quality: m.quality
+      };
+
+      console.log(`WEEK ${range.startStr}..${range.endStr}: POSTS ${m.count}`);
+    }
   }
 
   await appendWeekly(s, weeklyRows);
   await appendRaw(s, rawRows);
-  await appendStoriesWeekly(s, storiesRows);
 
   await c.disconnect();
-  console.log("FINAL PRO + RECO DONE");
+  console.log("FINAL PRO + RECO BACKFILL+INCREMENTAL DONE");
 }
 
 main().catch(e => {
