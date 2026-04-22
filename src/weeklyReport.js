@@ -339,7 +339,7 @@ function buildWeeklyRow(ch, week, metrics, prevMetrics, bestPost, worstPost) {
   ];
 }
 
-function computePostMetrics(subs, posts) {
+function computePostMetrics(subsBase, posts) {
   const views = posts.map(m => m.views || 0);
   const reacts = posts.map(reactions);
   const comm = posts.map(comments);
@@ -349,7 +349,7 @@ function computePostMetrics(subs, posts) {
   const avgR = avg(reacts), avgC = avg(comm), avgF = avg(rep);
   const tV = sum(views), tR = sum(reacts), tC = sum(comm), tF = sum(rep);
 
-  const erV = pct(avgViews, subs);
+  const erV = pct(avgViews, subsBase);
   const erA = avgViews ? Number((((avgR + avgC + avgF) / avgViews) * 100).toFixed(2)) : 0;
   const eng = posts.length ? Number(((tR + tC + tF) / posts.length).toFixed(2)) : 0;
   const eng1000 = tV ? Number((((tR + tC + tF) / tV) * 1000).toFixed(2)) : 0;
@@ -366,7 +366,7 @@ function computePostMetrics(subs, posts) {
 
   return {
     metrics: {
-      subs, avgViews, medViews, erV, erA, avgR, avgC, avgF,
+      subs: subsBase, avgViews, medViews, erV, erA, avgR, avgC, avgF,
       count: posts.length, tV, eng, eng1000, vir, vIndex, quality,
       best: Math.max(...views, 0), worst: views.length ? Math.min(...views) : 0
     },
@@ -514,13 +514,15 @@ async function main() {
     for (const week of weeks) {
       const weekPosts = postsByWeek.get(week.startStr) || [];
       const weekStories = storiesByWeek.get(week.startStr) || [];
-
-      const { metrics, bestPost, worstPost } = computePostMetrics(subs, weekPosts);
-      const weeklyRow = buildWeeklyRow(ch, week, metrics, prevMetrics, bestPost, worstPost);
       const weeklyKey = makeWeeklyKey(week.startStr, week.endStr, ch);
+      const existingWeekly = existingWeeklyMap.get(weeklyKey);
+      const subsBase = existingWeekly ? Number(existingWeekly.row[3] || subs) : subs;
 
-      if (existingWeeklyMap.has(weeklyKey)) {
-        const existing = existingWeeklyMap.get(weeklyKey);
+      const { metrics, bestPost, worstPost } = computePostMetrics(subsBase, weekPosts);
+      const weeklyRow = buildWeeklyRow(ch, week, metrics, prevMetrics, bestPost, worstPost);
+
+      if (existingWeekly) {
+        const existing = existingWeekly;
         const current = existing.row;
 
         const updateCols = [5, ...Array.from({ length: 25 }, (_, i) => i + 7)]; // E and G:AE
@@ -581,6 +583,7 @@ async function main() {
     }
 
     console.log(`WEEKS: ${weeks.length}, POSTS: ${allPosts.length}, STORIES: ${allStories.length}`);
+    console.log(`SUBS NOW: ${subs}`);
   }
 
   await batchValueUpdates(s, weeklyUpdates);
