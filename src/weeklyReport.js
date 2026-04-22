@@ -96,6 +96,38 @@ function normalizeCell(v) {
   return String(v);
 }
 
+
+function extractStoryMetrics(story) {
+  const v = story?.views || {};
+  const views =
+    v?.viewsCount ??
+    v?.views_count ??
+    v?.views ??
+    0;
+
+  const forwards =
+    v?.forwardsCount ??
+    v?.forwards_count ??
+    v?.forwards ??
+    0;
+
+  const reactionsList = v?.reactions?.results || [];
+  const reactions = reactionsList.reduce((a, r) => a + (r?.count || 0), 0);
+
+  const rawDate = story?.date
+    ? (typeof story.date === "number" ? new Date(story.date * 1000) : new Date(story.date))
+    : null;
+
+  return {
+    id: story?.id ?? "",
+    date: rawDate,
+    views,
+    forwards,
+    reactions
+  };
+}
+
+
 const reactions = (m) => (m?.reactions?.results || []).reduce((a, i) => a + (i.count || 0), 0);
 const comments = (m) => m?.replies?.replies || 0;
 
@@ -267,7 +299,7 @@ async function collectPosts(client, entity) {
   return posts;
 }
 
-async function getStoriesStats(client, entity) {
+async function getStoriesStatsAll(client, entity) {
   try {
     const res = await client.invoke(
       new Api.stories.GetPeerStories({
@@ -276,56 +308,146 @@ async function getStoriesStats(client, entity) {
     );
 
     const stories = res?.stories?.stories || [];
-    const count = stories.length;
-
-    const storyViews = stories.map(s => {
-      const v = s?.views;
-      return v?.viewsCount || v?.views_count || 0;
-    });
-
-    const storyForwards = stories.map(s => {
-      const v = s?.views;
-      return v?.forwardsCount || v?.forwards_count || 0;
-    });
-
-    const storyReactions = stories.map(s => {
-      const v = s?.views;
-      const rx = v?.reactions?.results || [];
-      return rx.reduce((a, r) => a + (r.count || 0), 0);
-    });
-
-    const avgViews = count ? Number((storyViews.reduce((a, b) => a + b, 0) / count).toFixed(2)) : 0;
-    const avgActions = count ? Number((storyReactions.reduce((a, b) => a + b, 0) + storyForwards.reduce((a, b) => a + b, 0)) / count).toFixed(2) : 0;
-    const erStories = avgViews ? Number(((avgActions / avgViews) * 100).toFixed(2)) : 0;
-
-    let topStory = "";
-    if (stories.length) {
-      const bestIndex = storyViews.reduce((best, v, i, arr) => v > arr[best] ? i : best, 0);
-      const best = stories[bestIndex];
-      const bestDate = best?.date
-        ? (typeof best.date === "number" ? new Date(best.date * 1000) : new Date(best.date))
-        : null;
-      const bestId = best?.id ?? "";
-      const bestViews = storyViews[bestIndex] || 0;
-      topStory = bestDate && !Number.isNaN(bestDate.getTime())
-        ? `${bestDate.toISOString()} | id:${bestId} | views:${bestViews}`
-        : `id:${bestId} | views:${bestViews}`;
-    }
-
-    return { count, avgViews, erStories, topStory };
+    return stories
+      .map(extractStoryMetrics)
+      .filter(x => x.date && !Number.isNaN(x.date.getTime()));
   } catch (e) {
     console.log("Stories error:", e.message);
-    return { count: 0, avgViews: 0, erStories: 0, topStory: "" };
+    return [];
   }
 }
 
-async function appendStoriesWeekly(s, rows) {
-  if (!rows.length) return;
-  await s.spreadsheets.values.append({
+function buildWeeklyRow(ch, week, metrics, prevMetrics, bestPost, worstPost) {
+  const dSubs = delta(metrics.subs, prevMetrics?.subs);
+  const dSubsPct = deltaPct(metrics.subs, prevMetrics?.subs);
+
+  const dViews = delta(metrics.avgViews, prevMetrics?.avgViews);
+  const dViewsPct = deltaPct(metrics.avgViews, prevMetrics?.avgViews);
+
+  const dErV = delta(metrics.erV, prevMetrics?.erViews);
+  const dErVPct = deltaPct(metrics.erV, prevMetrics?.erViews);
+
+  const dErA = delta(metrics.erA, prevMetrics?.erAct);
+  const dErAPct = deltaPct(metrics.erA, prevMetrics?.erAct);
+
+  const dQ = delta(metrics.quality, prevMetrics?.quality);
+  const dQPct = deltaPct(metrics.quality, prevMetrics?.quality);
+
+  const reco = classifyRecommendation(metrics, prevMetrics, bestPost, worstPost);
+
+  return [
+    week.startStr, week.endStr, ch, metrics.subs,
+    metrics.avgViews, "", metrics.medViews,
+    metrics.erV, metrics.erA,
+    metrics.avgR, metrics.avgC, metrics.avgF,
+    metrics.count, metrics.tV,
+    metrics.eng, metrics.eng1000,
+    metrics.vir, metrics.vIndex,
+    metrics.quality,
+    metrics.best, metrics.worst,
+    dSubs, dSubsPct,
+    dViews, dViewsPct,
+    dErV, dErVPct,
+    dErA, dErAPct,
+    dQ, dQPct,
+    reco.status, reco.reason,
+    reco.main, reco.scale, reco.reduce
+  ];
+}
+
+function computePostMetrics(subsBase, posts) {
+  const views = posts.map(m => m.views || 0);
+  const reacts = posts.map(reactions);
+  const comm = posts.map(comments);
+  const rep = posts.map(m => m.forwards || 0);
+
+  const avgViews = avg(views), medViews = median(views);
+  const avgR = avg(reacts), avgC = avg(comm), avgF = avg(rep);
+  const tV = sum(views), tR = sum(reacts), tC = sum(comm), tF = sum(rep);
+
+  const erV = pct(avgViews, subsBase);
+  const erA = avgViews ? Number((((avgR + avgC + avgF) / avgViews) * 100).toFixed(2)) : 0;
+  const eng = posts.length ? Number(((tR + tC + tF) / posts.length).toFixed(2)) : 0;
+  const eng1000 = tV ? Number((((tR + tC + tF) / tV) * 1000).toFixed(2)) : 0;
+  const vir = pct(tF, tV);
+  const vIndex = tV ? Number((((tF * 2) + (tC * 1.5) + tR) / tV * 100).toFixed(2)) : 0;
+  const quality = Number((erV * 0.4 + erA * 0.3 + vir * 0.2 + eng1000 * 0.1).toFixed(2));
+
+  let bestPost = null;
+  let worstPost = null;
+  if (posts.length) {
+    bestPost = posts.reduce((max, p) => (p.views || 0) > (max.views || 0) ? p : max, posts[0]);
+    worstPost = posts.reduce((min, p) => (p.views || 0) < (min.views || 0) ? p : min, posts[0]);
+  }
+
+  return {
+    metrics: {
+      subs: subsBase, avgViews, medViews, erV, erA, avgR, avgC, avgF,
+      count: posts.length, tV, eng, eng1000, vir, vIndex, quality,
+      best: Math.max(...views, 0), worst: views.length ? Math.min(...views) : 0
+    },
+    bestPost,
+    worstPost
+  };
+}
+
+function computeStoriesRow(ch, week, stories) {
+  const count = stories.length;
+  const storyViews = stories.map(s => s.views || 0);
+  const storyForwards = stories.map(s => s.forwards || 0);
+  const storyReactions = stories.map(s => s.reactions || 0);
+
+  const avgViews = count ? Number((sum(storyViews) / count).toFixed(2)) : 0;
+  const avgActions = count ? Number(((sum(storyReactions) + sum(storyForwards)) / count).toFixed(2)) : 0;
+  const erStories = avgViews ? Number(((avgActions / avgViews) * 100).toFixed(2)) : 0;
+
+  let topStory = "";
+  if (stories.length) {
+    const best = stories.reduce((max, cur) => cur.views > max.views ? cur : max, stories[0]);
+    topStory = best.date && !Number.isNaN(best.date.getTime())
+      ? `${best.date.toISOString()} | id:${best.id} | views:${best.views}`
+      : `id:${best.id} | views:${best.views}`;
+  }
+
+  return [
+    week.startStr,
+    week.endStr,
+    ch,
+    count,
+    avgViews,
+    erStories,
+    topStory
+  ];
+}
+
+function buildRawRows(ch, week, posts) {
+  return posts.map(m => {
+    const v = m.views || 0;
+    const r = reactions(m);
+    const c = comments(m);
+    const fwd = m.forwards || 0;
+    const postEr = v ? Number((((r + c + fwd) / v) * 100).toFixed(2)) : 0;
+    const postVirality = v ? Number(((fwd / v) * 100).toFixed(2)) : 0;
+
+    return [
+      week.startStr, week.endStr, ch,
+      toDate(m)?.toISOString() || "",
+      m.id || "",
+      truncateText(m.message || m.media?.caption || ""),
+      v, r, c, fwd,
+      postEr, postVirality
+    ];
+  });
+}
+
+async function batchValueUpdates(s, updates) {
+  if (!updates.length) return;
+  await s.spreadsheets.values.batchUpdate({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: "stories_weekly!A2",
-    valueInputOption: "RAW",
-    requestBody: { values: rows }
+    requestBody: {
+      valueInputOption: "RAW",
+      data: updates
+    }
   });
 }
 
@@ -340,7 +462,7 @@ async function appendRows(s, range, rows) {
 }
 
 async function main() {
-  console.log("FINAL BACKFILL + INCREMENTAL + CORRECT STORIES");
+  console.log("FINAL BACKFILL + INCREMENTAL + STORIES FIXED");
 
   const c = await tg();
   const s = await sheets();
@@ -374,17 +496,40 @@ async function main() {
     const subs = full?.fullChat?.participantsCount || 0;
 
     const allPosts = await collectPosts(c, entity);
+    const allStories = await getStoriesStatsAll(c, entity);
 
     const earliestPostDate = allPosts.length ? toDate(allPosts[allPosts.length - 1]) : null;
-    let earliestDate = earliestPostDate || null;
+    const earliestStoryDate = allStories.length
+      ? allStories.reduce((min, cur) => cur.date < min ? cur.date : min, allStories[0].date)
+      : null;
+
+    let earliestDate = null;
+    if (earliestPostDate && earliestStoryDate) earliestDate = earliestPostDate < earliestStoryDate ? earliestPostDate : earliestStoryDate;
+    else earliestDate = earliestPostDate || earliestStoryDate;
 
     const weeks = buildWeekSeries(earliestDate);
     const postsByWeek = new Map();
+    const storiesByWeek = new Map();
+
+    for (const post of allPosts) {
+      const d = toDate(post);
+      if (!d) continue;
+      const key = weekKeyFromDate(d);
+      if (!postsByWeek.has(key)) postsByWeek.set(key, []);
+      postsByWeek.get(key).push(post);
+    }
+
+    for (const story of allStories) {
+      const key = weekKeyFromDate(story.date);
+      if (!storiesByWeek.has(key)) storiesByWeek.set(key, []);
+      storiesByWeek.get(key).push(story);
+    }
 
     let prevMetrics = null;
 
     for (const week of weeks) {
       const weekPosts = postsByWeek.get(week.startStr) || [];
+      const weekStories = storiesByWeek.get(week.startStr) || [];
       const weeklyKey = makeWeeklyKey(week.startStr, week.endStr, ch);
       const existingWeekly = existingWeeklyMap.get(weeklyKey);
       const subsBase = existingWeekly ? Number(existingWeekly.row[3] || subs) : subs;
@@ -432,42 +577,28 @@ async function main() {
         }
       }
 
+      const storiesRow = computeStoriesRow(ch, week, weekStories);
+      if (existingStoriesMap.has(weeklyKey)) {
+        const existing = existingStoriesMap.get(weeklyKey);
+        const current = existing.row;
+        for (let col = 4; col <= 7; col++) {
+          const currentVal = normalizeCell(current[col - 1]);
+          const newVal = normalizeCell(storiesRow[col - 1]);
+          if (currentVal !== newVal) {
+            storiesUpdates.push({
+              range: `stories_weekly!${colLetter(col)}${existing.rowNumber}`,
+              values: [[storiesRow[col - 1]]]
+            });
+          }
+        }
+      } else {
+        storiesToAppend.push(storiesRow);
+      }
 
       prevMetrics = metrics;
     }
 
-    console.log(`WEEKS: ${weeks.length}, POSTS: ${allPosts.length}`);
-    const stories = await getStoriesStats(c, entity);
-    console.log("STORIES FOUND:", stories.count);
-    const currentRange = weekRange();
-    const currentStoriesKey = makeWeeklyKey(currentRange.startStr, currentRange.endStr, ch);
-    const storiesRow = [
-      currentRange.startStr,
-      currentRange.endStr,
-      ch,
-      stories.count,
-      stories.avgViews,
-      stories.erStories,
-      stories.topStory
-    ];
-
-    if (existingStoriesMap.has(currentStoriesKey)) {
-      const existing = existingStoriesMap.get(currentStoriesKey);
-      const current = existing.row;
-      for (let col = 4; col <= 7; col++) {
-        const currentVal = normalizeCell(current[col - 1]);
-        const newVal = normalizeCell(storiesRow[col - 1]);
-        if (currentVal !== newVal) {
-          storiesUpdates.push({
-            range: `stories_weekly!${colLetter(col)}${existing.rowNumber}`,
-            values: [[storiesRow[col - 1]]]
-          });
-        }
-      }
-    } else {
-      storiesToAppend.push(storiesRow);
-    }
-
+    console.log(`WEEKS: ${weeks.length}, POSTS: ${allPosts.length}, STORIES: ${allStories.length}`);
     console.log(`SUBS NOW: ${subs}`);
   }
 
@@ -480,7 +611,7 @@ async function main() {
   await appendRows(s, "stories_weekly!A2", storiesToAppend);
 
   await c.disconnect();
-  console.log("FINAL BACKFILL + INCREMENTAL + CORRECT STORIES DONE");
+  console.log("FINAL BACKFILL + INCREMENTAL + STORIES FIXED DONE");
 }
 
 main().catch(e => {
