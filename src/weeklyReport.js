@@ -267,59 +267,6 @@ async function collectPosts(client, entity) {
   return posts;
 }
 
-
-async function getStoriesStats(client, entity) {
-  try {
-    const res = await client.invoke(
-      new Api.stories.GetPeerStories({
-        peer: entity
-      })
-    );
-
-    const stories = res?.stories?.stories || [];
-    const count = stories.length;
-
-    const storyViews = stories.map(s => {
-      const v = s?.views;
-      return v?.viewsCount || v?.views_count || 0;
-    });
-
-    const storyForwards = stories.map(s => {
-      const v = s?.views;
-      return v?.forwardsCount || v?.forwards_count || 0;
-    });
-
-    const storyReactions = stories.map(s => {
-      const v = s?.views;
-      const rx = v?.reactions?.results || [];
-      return rx.reduce((a, r) => a + (r.count || 0), 0);
-    });
-
-    const avgViews = count ? Number((storyViews.reduce((a, b) => a + b, 0) / count).toFixed(2)) : 0;
-    const avgActions = count ? Number(((storyReactions.reduce((a, b) => a + b, 0) + storyForwards.reduce((a, b) => a + b, 0)) / count).toFixed(2)) : 0;
-    const erStories = avgViews ? Number(((avgActions / avgViews) * 100).toFixed(2)) : 0;
-
-    let topStory = "";
-    if (stories.length) {
-      const bestIndex = storyViews.reduce((best, v, i, arr) => v > arr[best] ? i : best, 0);
-      const best = stories[bestIndex];
-      const bestDate = best?.date
-        ? (typeof best.date === "number" ? new Date(best.date * 1000) : new Date(best.date))
-        : null;
-      const bestId = best?.id ?? "";
-      const bestViews = storyViews[bestIndex] || 0;
-      topStory = bestDate && !Number.isNaN(bestDate.getTime())
-        ? `${bestDate.toISOString()} | id:${bestId} | views:${bestViews}`
-        : `id:${bestId} | views:${bestViews}`;
-    }
-
-    return { count, avgViews, erStories, topStory };
-  } catch (e) {
-    console.log("Stories error:", e.message);
-    return { count: 0, avgViews: 0, erStories: 0, topStory: "" };
-  }
-}
-
 async function getStoriesStatsAll(client, entity) {
   try {
     const res = await client.invoke(
@@ -488,17 +435,6 @@ async function batchValueUpdates(s, updates) {
   });
 }
 
-
-async function appendStoriesWeekly(s, rows) {
-  if (!rows.length) return;
-  await s.spreadsheets.values.append({
-    spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: "stories_weekly!A2",
-    valueInputOption: "RAW",
-    requestBody: { values: rows }
-  });
-}
-
 async function appendRows(s, range, rows) {
   if (!rows.length) return;
   await s.spreadsheets.values.append({
@@ -510,7 +446,7 @@ async function appendRows(s, range, rows) {
 }
 
 async function main() {
-  console.log("FINAL BACKFILL + INCREMENTAL + STORIES LAST WEEK ONLY");
+  console.log("FINAL BACKFILL + INCREMENTAL");
 
   const c = await tg();
   const s = await sheets();
@@ -534,6 +470,7 @@ async function main() {
   const storiesToAppend = [];
   const weeklyUpdates = [];
   const rawUpdates = [];
+  const storiesUpdates = [];
 
   for (const ch of chs) {
     console.log("CHANNEL:", ch);
@@ -543,17 +480,40 @@ async function main() {
     const subs = full?.fullChat?.participantsCount || 0;
 
     const allPosts = await collectPosts(c, entity);
+    const allStories = await getStoriesStatsAll(c, entity);
 
     const earliestPostDate = allPosts.length ? toDate(allPosts[allPosts.length - 1]) : null;
-    let earliestDate = earliestPostDate || null;
+    const earliestStoryDate = allStories.length
+      ? allStories.reduce((min, cur) => cur.date < min ? cur.date : min, allStories[0].date)
+      : null;
+
+    let earliestDate = null;
+    if (earliestPostDate && earliestStoryDate) earliestDate = earliestPostDate < earliestStoryDate ? earliestPostDate : earliestStoryDate;
+    else earliestDate = earliestPostDate || earliestStoryDate;
 
     const weeks = buildWeekSeries(earliestDate);
     const postsByWeek = new Map();
+    const storiesByWeek = new Map();
+
+    for (const post of allPosts) {
+      const d = toDate(post);
+      if (!d) continue;
+      const key = weekKeyFromDate(d);
+      if (!postsByWeek.has(key)) postsByWeek.set(key, []);
+      postsByWeek.get(key).push(post);
+    }
+
+    for (const story of allStories) {
+      const key = weekKeyFromDate(story.date);
+      if (!storiesByWeek.has(key)) storiesByWeek.set(key, []);
+      storiesByWeek.get(key).push(story);
+    }
 
     let prevMetrics = null;
 
     for (const week of weeks) {
       const weekPosts = postsByWeek.get(week.startStr) || [];
+      const weekStories = storiesByWeek.get(week.startStr) || [];
       const weeklyKey = makeWeeklyKey(week.startStr, week.endStr, ch);
       const existingWeekly = existingWeeklyMap.get(weeklyKey);
       const subsBase = existingWeekly ? Number(existingWeekly.row[3] || subs) : subs;
@@ -601,43 +561,41 @@ async function main() {
         }
       }
 
+      const storiesRow = computeStoriesRow(ch, week, weekStories);
+      if (existingStoriesMap.has(weeklyKey)) {
+        const existing = existingStoriesMap.get(weeklyKey);
+        const current = existing.row;
+        for (let col = 4; col <= 7; col++) {
+          const currentVal = normalizeCell(current[col - 1]);
+          const newVal = normalizeCell(storiesRow[col - 1]);
+          if (currentVal !== newVal) {
+            storiesUpdates.push({
+              range: `stories_weekly!${colLetter(col)}${existing.rowNumber}`,
+              values: [[storiesRow[col - 1]]]
+            });
+          }
+        }
+      } else {
+        storiesToAppend.push(storiesRow);
+      }
+
       prevMetrics = metrics;
     }
 
-    console.log(`WEEKS: ${weeks.length}, POSTS: ${allPosts.length}`);
-    const lastCompletedWeek = weekRange();
-    const storiesKey = makeWeeklyKey(lastCompletedWeek.startStr, lastCompletedWeek.endStr, ch);
-
-    if (!existingStoriesMap.has(storiesKey)) {
-      const stories = await getStoriesStats(c, entity);
-      console.log("STORIES FOUND:", stories.count);
-
-      storiesToAppend.push([
-        lastCompletedWeek.startStr,
-        lastCompletedWeek.endStr,
-        ch,
-        stories.count,
-        stories.avgViews,
-        stories.erStories,
-        stories.topStory
-      ]);
-    } else {
-      console.log("STORIES SKIPPED: week already exists");
-    }
-
+    console.log(`WEEKS: ${weeks.length}, POSTS: ${allPosts.length}, STORIES: ${allStories.length}`);
     console.log(`SUBS NOW: ${subs}`);
   }
 
   await batchValueUpdates(s, weeklyUpdates);
   await batchValueUpdates(s, rawUpdates);
+  await batchValueUpdates(s, storiesUpdates);
 
   await appendRows(s, "weekly_stats!A2", weeklyToAppend);
   await appendRows(s, "posts_raw!A2", rawToAppend);
-  await appendStoriesWeekly(s, storiesToAppend);
   await appendRows(s, "stories_weekly!A2", storiesToAppend);
 
   await c.disconnect();
-  console.log("FINAL BACKFILL + INCREMENTAL + STORIES LAST WEEK ONLY DONE");
+  console.log("FINAL BACKFILL + INCREMENTAL DONE");
 }
 
 main().catch(e => {
