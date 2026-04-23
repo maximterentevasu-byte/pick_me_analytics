@@ -96,38 +96,6 @@ function normalizeCell(v) {
   return String(v);
 }
 
-
-function extractStoryMetrics(story) {
-  const v = story?.views || {};
-  const views =
-    v?.viewsCount ??
-    v?.views_count ??
-    v?.views ??
-    0;
-
-  const forwards =
-    v?.forwardsCount ??
-    v?.forwards_count ??
-    v?.forwards ??
-    0;
-
-  const reactionsList = v?.reactions?.results || [];
-  const reactions = reactionsList.reduce((a, r) => a + (r?.count || 0), 0);
-
-  const rawDate = story?.date
-    ? (typeof story.date === "number" ? new Date(story.date * 1000) : new Date(story.date))
-    : null;
-
-  return {
-    id: story?.id ?? "",
-    date: rawDate,
-    views,
-    forwards,
-    reactions
-  };
-}
-
-
 const reactions = (m) => (m?.reactions?.results || []).reduce((a, i) => a + (i.count || 0), 0);
 const comments = (m) => m?.replies?.replies || 0;
 
@@ -308,9 +276,25 @@ async function getStoriesStatsAll(client, entity) {
     );
 
     const stories = res?.stories?.stories || [];
-    return stories
-      .map(extractStoryMetrics)
-      .filter(x => x.date && !Number.isNaN(x.date.getTime()));
+    return stories.map(story => {
+      const rawDate = story?.date
+        ? (typeof story.date === "number" ? new Date(story.date * 1000) : new Date(story.date))
+        : null;
+
+      const v = story?.views;
+      const views = v?.viewsCount || v?.views_count || 0;
+      const forwards = v?.forwardsCount || v?.forwards_count || 0;
+      const rx = v?.reactions?.results || [];
+      const reactions = rx.reduce((a, r) => a + (r.count || 0), 0);
+
+      return {
+        id: story?.id ?? "",
+        date: rawDate,
+        views,
+        forwards,
+        reactions
+      };
+    }).filter(x => x.date && !Number.isNaN(x.date.getTime()));
   } catch (e) {
     console.log("Stories error:", e.message);
     return [];
@@ -462,7 +446,7 @@ async function appendRows(s, range, rows) {
 }
 
 async function main() {
-  console.log("FINAL BACKFILL + INCREMENTAL + STORIES FIXED");
+  console.log("FINAL BACKFILL + INCREMENTAL + STORIES LAST WEEK ONLY");
 
   const c = await tg();
   const s = await sheets();
@@ -599,6 +583,26 @@ async function main() {
     }
 
     console.log(`WEEKS: ${weeks.length}, POSTS: ${allPosts.length}, STORIES: ${allStories.length}`);
+    const lastCompletedWeek = weekRange();
+    const storiesKey = makeWeeklyKey(lastCompletedWeek.startStr, lastCompletedWeek.endStr, ch);
+
+    if (!existingStoriesMap.has(storiesKey)) {
+      const stories = await getStoriesStats(c, entity);
+      console.log("STORIES FOUND:", stories.count);
+
+      storiesToAppend.push([
+        lastCompletedWeek.startStr,
+        lastCompletedWeek.endStr,
+        ch,
+        stories.count,
+        stories.avgViews,
+        stories.erStories,
+        stories.topStory
+      ]);
+    } else {
+      console.log("STORIES SKIPPED: week already exists");
+    }
+
     console.log(`SUBS NOW: ${subs}`);
   }
 
@@ -608,10 +612,11 @@ async function main() {
 
   await appendRows(s, "weekly_stats!A2", weeklyToAppend);
   await appendRows(s, "posts_raw!A2", rawToAppend);
+  await appendStoriesWeekly(s, storiesToAppend);
   await appendRows(s, "stories_weekly!A2", storiesToAppend);
 
   await c.disconnect();
-  console.log("FINAL BACKFILL + INCREMENTAL + STORIES FIXED DONE");
+  console.log("FINAL BACKFILL + INCREMENTAL + STORIES LAST WEEK ONLY DONE");
 }
 
 main().catch(e => {
