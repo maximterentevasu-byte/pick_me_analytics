@@ -774,6 +774,8 @@ async function main() {
       prevMetrics = metrics;
     }
 
+    postingAnalysisRows.push(buildPostingAnalysisRow(ch, weeks, postsByWeek));
+
     console.log(`WEEKS: ${weeks.length}, POSTS: ${allPosts.length}, STORIES: ${allStories.length}`);
     console.log(`SUBS NOW: ${subs}`);
   }
