@@ -4,6 +4,13 @@ const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const { google } = require("googleapis");
 
+const SHEETS = {
+  weekly: "TG_недели",
+  raw: "TG_посты",
+  stories: "TG_сторис",
+  postingAnalysis: "TG_лучшее_время"
+};
+
 const avg = (a, d = 2) => a.length ? Number((a.reduce((x, y) => x + y, 0) / a.length).toFixed(d)) : 0;
 const sum = (a) => a.reduce((x, y) => x + y, 0);
 const pct = (a, b, d = 2) => b ? Number(((a / b) * 100).toFixed(d)) : 0;
@@ -115,6 +122,37 @@ function getEkbTimeSlot(date) {
   return `${String(start).padStart(2, "0")}:00–${String(end).padStart(2, "0")}:59`;
 }
 
+function getEkbDateStr(date) {
+  return getEkbDate(date).toISOString().slice(0, 10);
+}
+
+function getEkbTimeStr(date) {
+  return getEkbDate(date).toISOString().slice(11, 16);
+}
+
+function hasAudienceQuestion(text) {
+  const clean = String(text || "").toLowerCase().replace(/ё/g, "е");
+  if (!clean.trim()) return "нет";
+  if (/[?？]/.test(clean)) return "да";
+
+  const questionPatterns = [
+    /\bкак\s+(вы\s+)?думаете\b/,
+    /\bчто\s+(вы\s+)?думаете\b/,
+    /\bкак\s+считаете\b/,
+    /\bсогласны\b/,
+    /\bа\s+вы\b/,
+    /\bнапишите\b/,
+    /\bподелитесь\b/,
+    /\bрасскажите\b/,
+    /\bвыбирайте\b/,
+    /\bкакой\b|\bкакая\b|\bкакие\b|\bкакое\b/,
+    /\bкто\b|\bчто\b|\bгде\b|\bкогда\b|\bкуда\b|\bоткуда\b|\bзачем\b|\bпочему\b|\bсколько\b/,
+    /\bстоит\s+ли\b|\bнужно\s+ли\b|\bможно\s+ли\b|\bбыли\s+ли\b|\bесть\s+ли\b/
+  ];
+
+  return questionPatterns.some(pattern => pattern.test(clean)) ? "да" : "нет";
+}
+
 function computePostScore(post, avgViewsBase) {
   const views = post.views || 0;
   const r = reactions(post);
@@ -170,7 +208,8 @@ function computeBestPostingSlots(posts, avgViewsBase = null) {
   if (!posts.length) {
     return {
       bestDay: "Нет постов",
-      bestTime: "Нет постов"
+      bestTime: "Нет постов",
+      bestDayTime: "Нет постов"
     };
   }
 
@@ -178,6 +217,7 @@ function computeBestPostingSlots(posts, avgViewsBase = null) {
   const avgViews = avgViewsBase || avg(views);
   const byDay = new Map();
   const byTime = new Map();
+  const byDayTime = new Map();
 
   for (const post of posts) {
     const d = toDate(post);
@@ -185,13 +225,18 @@ function computeBestPostingSlots(posts, avgViewsBase = null) {
 
     const postViews = post.views || 0;
     const score = computePostScore(post, avgViews);
-    pushTimingStat(byDay, getEkbDayName(d), score, postViews);
-    pushTimingStat(byTime, getEkbTimeSlot(d), score, postViews);
+    const day = getEkbDayName(d);
+    const time = getEkbTimeSlot(d);
+
+    pushTimingStat(byDay, day, score, postViews);
+    pushTimingStat(byTime, time, score, postViews);
+    pushTimingStat(byDayTime, `${day} ${time}`, score, postViews);
   }
 
   return {
     bestDay: pickBestTimingStat(byDay),
-    bestTime: pickBestTimingStat(byTime)
+    bestTime: pickBestTimingStat(byTime),
+    bestDayTime: pickBestTimingStat(byDayTime)
   };
 }
 
@@ -215,6 +260,7 @@ function buildPostingAnalysisRow(ch, weeks, postsByWeek) {
     posts.length,
     timing.bestDay,
     timing.bestTime,
+    timing.bestDayTime,
     recommendation,
     updatedAt
   ];
@@ -309,14 +355,15 @@ async function ensureHeaders(s) {
     "Δ Индекс качества","Δ% Индекс качества",
     "Статус недели","Причина",
     "Главная рекомендация","Что масштабировать","Что снижать",
-    "Лучший день публикации","Лучшее время публикации ЕКБ"
+    "Лучший день публикации","Лучшее время публикации ЕКБ","Лучший день + время"
   ]];
 
   const rawHeader = [[
     "Дата начала недели","Дата конца недели","Канал",
-    "Дата поста","ID поста","Текст поста",
+    "Дата поста","Дата публикации ЕКБ","Время публикации ЕКБ",
+    "ID поста","Текст поста",
     "Просмотры","Реакции","Комментарии","Репосты",
-    "ER поста %","Виральность поста %"
+    "ER поста %","Виральность поста %","Был вопрос"
   ]];
 
   const storiesHeader = [[
@@ -327,19 +374,19 @@ async function ensureHeaders(s) {
   const postingAnalysisHeader = [[
     "Период начала","Период конца","Канал",
     "Недель в анализе","Постов",
-    "Лучший день публикации","Лучшее время публикации ЕКБ",
+    "Лучший день публикации","Лучшее время публикации ЕКБ","Лучший день + время",
     "Рекомендация","Дата обновления"
   ]];
 
   const resWeekly = await s.spreadsheets.values.get({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: "weekly_stats!A1:AL1"
+    range: `${SHEETS.weekly}!A1:AM1`
   }).catch(() => ({ data: {} }));
 
   if (!resWeekly.data.values || resWeekly.data.values.length === 0) {
     await s.spreadsheets.values.update({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: "weekly_stats!A1",
+      range: `${SHEETS.weekly}!A1`,
       valueInputOption: "RAW",
       requestBody: { values: weeklyHeader }
     });
@@ -350,7 +397,7 @@ async function ensureHeaders(s) {
     for (let i = 0; i < expectedHeader.length; i++) {
       if (normalizeCell(currentHeader[i]) !== normalizeCell(expectedHeader[i])) {
         headerUpdates.push({
-          range: `weekly_stats!${colLetter(i + 1)}1`,
+          range: `${SHEETS.weekly}!${colLetter(i + 1)}1`,
           values: [[expectedHeader[i]]]
         });
       }
@@ -360,13 +407,13 @@ async function ensureHeaders(s) {
 
   const resRaw = await s.spreadsheets.values.get({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: "posts_raw!A1:A1"
+    range: `${SHEETS.raw}!A1:O1`
   }).catch(() => ({ data: {} }));
 
   if (!resRaw.data.values || resRaw.data.values.length === 0) {
     await s.spreadsheets.values.update({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: "posts_raw!A1",
+      range: `${SHEETS.raw}!A1`,
       valueInputOption: "RAW",
       requestBody: { values: rawHeader }
     });
@@ -374,13 +421,13 @@ async function ensureHeaders(s) {
 
   const resStories = await s.spreadsheets.values.get({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: "stories_weekly!A1:A1"
+    range: `${SHEETS.stories}!A1:G1`
   }).catch(() => ({ data: {} }));
 
   if (!resStories.data.values || resStories.data.values.length === 0) {
     await s.spreadsheets.values.update({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: "stories_weekly!A1",
+      range: `${SHEETS.stories}!A1`,
       valueInputOption: "RAW",
       requestBody: { values: storiesHeader }
     });
@@ -388,13 +435,13 @@ async function ensureHeaders(s) {
 
   const resPostingAnalysis = await s.spreadsheets.values.get({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range: "posting_time_analysis!A1:I1"
+    range: `${SHEETS.postingAnalysis}!A1:J1`
   }).catch(() => ({ data: {} }));
 
   if (!resPostingAnalysis.data.values || resPostingAnalysis.data.values.length === 0) {
     await s.spreadsheets.values.update({
       spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: "posting_time_analysis!A1",
+      range: `${SHEETS.postingAnalysis}!A1`,
       valueInputOption: "RAW",
       requestBody: { values: postingAnalysisHeader }
     });
@@ -405,7 +452,7 @@ async function ensureHeaders(s) {
     for (let i = 0; i < expectedHeader.length; i++) {
       if (normalizeCell(currentHeader[i]) !== normalizeCell(expectedHeader[i])) {
         headerUpdates.push({
-          range: `posting_time_analysis!${colLetter(i + 1)}1`,
+          range: `${SHEETS.postingAnalysis}!${colLetter(i + 1)}1`,
           values: [[expectedHeader[i]]]
         });
       }
@@ -426,8 +473,13 @@ function makeWeeklyKey(startStr, endStr, ch) {
   return `${startStr}|${endStr}|${ch}`;
 }
 
-function makeRawKey(row) {
-  return `${row[0]}|${row[1]}|${row[2]}|${row[4]}`;
+function makeRawKeyFromExisting(row) {
+  const postId = row.length >= 15 ? row[6] : row[4];
+  return `${row[0]}|${row[1]}|${row[2]}|${postId}`;
+}
+
+function makeRawKeyFromNew(row) {
+  return `${row[0]}|${row[1]}|${row[2]}|${row[6]}`;
 }
 
 async function collectPosts(client, entity) {
@@ -508,7 +560,7 @@ function buildWeeklyRow(ch, week, metrics, prevMetrics, bestPost, worstPost) {
     dQ, dQPct,
     reco.status, reco.reason,
     reco.main, reco.scale, reco.reduce,
-    metrics.bestDay, metrics.bestTime
+    metrics.bestDay, metrics.bestTime, metrics.bestDayTime
   ];
 }
 
@@ -543,7 +595,7 @@ function computePostMetrics(subsBase, posts) {
       subs: subsBase, avgViews, medViews, erV, erA, avgR, avgC, avgF,
       count: posts.length, tV, eng, eng1000, vir, vIndex, quality,
       best: Math.max(...views, 0), worst: views.length ? Math.min(...views) : 0,
-      bestDay: postingSlots.bestDay, bestTime: postingSlots.bestTime
+      bestDay: postingSlots.bestDay, bestTime: postingSlots.bestTime, bestDayTime: postingSlots.bestDayTime
     },
     bestPost,
     worstPost
@@ -581,20 +633,25 @@ function computeStoriesRow(ch, week, stories) {
 
 function buildRawRows(ch, week, posts) {
   return posts.map(m => {
+    const d = toDate(m);
     const v = m.views || 0;
     const r = reactions(m);
     const c = comments(m);
     const fwd = m.forwards || 0;
+    const text = m.message || m.media?.caption || "";
     const postEr = v ? Number((((r + c + fwd) / v) * 100).toFixed(2)) : 0;
     const postVirality = v ? Number(((fwd / v) * 100).toFixed(2)) : 0;
 
     return [
       week.startStr, week.endStr, ch,
-      toDate(m)?.toISOString() || "",
+      d?.toISOString() || "",
+      d ? getEkbDateStr(d) : "",
+      d ? getEkbTimeStr(d) : "",
       m.id || "",
-      truncateText(m.message || m.media?.caption || ""),
+      truncateText(text),
       v, r, c, fwd,
-      postEr, postVirality
+      postEr, postVirality,
+      hasAudienceQuestion(text)
     ];
   });
 }
@@ -645,14 +702,14 @@ async function main() {
 
   await ensureHeaders(s);
 
-  const existingWeeklyRows = await getExistingRows(s, "weekly_stats!A2:AL");
-  const existingRawRows = await getExistingRows(s, "posts_raw!A2:L");
-  const existingStoriesRows = await getExistingRows(s, "stories_weekly!A2:G");
+  const existingWeeklyRows = await getExistingRows(s, `${SHEETS.weekly}!A2:AM`);
+  const existingRawRows = await getExistingRows(s, `${SHEETS.raw}!A2:O`);
+  const existingStoriesRows = await getExistingRows(s, `${SHEETS.stories}!A2:G`);
 
   const existingWeeklyMap = new Map();
   existingWeeklyRows.forEach((row, idx) => existingWeeklyMap.set(makeWeeklyKey(row[0], row[1], row[2]), { rowNumber: idx + 2, row }));
   const existingRawMap = new Map();
-  existingRawRows.forEach((row, idx) => existingRawMap.set(makeRawKey(row), { rowNumber: idx + 2, row }));
+  existingRawRows.forEach((row, idx) => existingRawMap.set(makeRawKeyFromExisting(row), { rowNumber: idx + 2, row }));
   const existingStoriesMap = new Map();
   existingStoriesRows.forEach((row, idx) => existingStoriesMap.set(makeWeeklyKey(row[0], row[1], row[2]), { rowNumber: idx + 2, row }));
 
@@ -662,7 +719,6 @@ async function main() {
   const postingAnalysisRows = [];
   const weeklyUpdates = [];
   const rawUpdates = [];
-  const storiesUpdates = [];
 
   for (const ch of chs) {
     console.log("CHANNEL:", ch);
@@ -675,17 +731,9 @@ async function main() {
     const allStories = await getStoriesStatsAll(c, entity);
 
     const earliestPostDate = allPosts.length ? toDate(allPosts[allPosts.length - 1]) : null;
-    const earliestStoryDate = allStories.length
-      ? allStories.reduce((min, cur) => cur.date < min ? cur.date : min, allStories[0].date)
-      : null;
-
-    let earliestDate = null;
-    if (earliestPostDate && earliestStoryDate) earliestDate = earliestPostDate < earliestStoryDate ? earliestPostDate : earliestStoryDate;
-    else earliestDate = earliestPostDate || earliestStoryDate;
-
-    const weeks = buildWeekSeries(earliestDate);
+    const weeks = buildWeekSeries(earliestPostDate);
+    const lastFullWeek = weekRange();
     const postsByWeek = new Map();
-    const storiesByWeek = new Map();
 
     for (const post of allPosts) {
       const d = toDate(post);
@@ -695,17 +743,11 @@ async function main() {
       postsByWeek.get(key).push(post);
     }
 
-    for (const story of allStories) {
-      const key = weekKeyFromDate(story.date);
-      if (!storiesByWeek.has(key)) storiesByWeek.set(key, []);
-      storiesByWeek.get(key).push(story);
-    }
 
     let prevMetrics = null;
 
     for (const week of weeks) {
       const weekPosts = postsByWeek.get(week.startStr) || [];
-      const weekStories = storiesByWeek.get(week.startStr) || [];
       const weeklyKey = makeWeeklyKey(week.startStr, week.endStr, ch);
       const existingWeekly = existingWeeklyMap.get(weeklyKey);
       const subsBase = existingWeekly ? Number(existingWeekly.row[3] || subs) : subs;
@@ -717,13 +759,13 @@ async function main() {
         const existing = existingWeekly;
         const current = existing.row;
 
-        const updateCols = [5, ...Array.from({ length: 25 }, (_, i) => i + 7), 37, 38]; // E, G:AE and AK:AL
+        const updateCols = [5, ...Array.from({ length: 25 }, (_, i) => i + 7), 37, 38, 39]; // E, G:AE and AK:AM
         for (const col of updateCols) {
           const currentVal = normalizeCell(current[col - 1]);
           const newVal = normalizeCell(weeklyRow[col - 1]);
           if (currentVal !== newVal) {
             weeklyUpdates.push({
-              range: `weekly_stats!${colLetter(col)}${existing.rowNumber}`,
+              range: `${SHEETS.weekly}!${colLetter(col)}${existing.rowNumber}`,
               values: [[weeklyRow[col - 1]]]
             });
           }
@@ -734,16 +776,16 @@ async function main() {
 
       const weekRawRows = buildRawRows(ch, week, weekPosts);
       for (const rawRow of weekRawRows) {
-        const rawKey = makeRawKey(rawRow);
+        const rawKey = makeRawKeyFromNew(rawRow);
         if (existingRawMap.has(rawKey)) {
           const existing = existingRawMap.get(rawKey);
           const current = existing.row;
-          for (let col = 7; col <= 12; col++) {
+          for (let col = 5; col <= 15; col++) {
             const currentVal = normalizeCell(current[col - 1]);
             const newVal = normalizeCell(rawRow[col - 1]);
             if (currentVal !== newVal) {
               rawUpdates.push({
-                range: `posts_raw!${colLetter(col)}${existing.rowNumber}`,
+                range: `${SHEETS.raw}!${colLetter(col)}${existing.rowNumber}`,
                 values: [[rawRow[col - 1]]]
               });
             }
@@ -753,25 +795,15 @@ async function main() {
         }
       }
 
-      const storiesRow = computeStoriesRow(ch, week, weekStories);
-      if (existingStoriesMap.has(weeklyKey)) {
-        const existing = existingStoriesMap.get(weeklyKey);
-        const current = existing.row;
-        for (let col = 4; col <= 7; col++) {
-          const currentVal = normalizeCell(current[col - 1]);
-          const newVal = normalizeCell(storiesRow[col - 1]);
-          if (currentVal !== newVal) {
-            storiesUpdates.push({
-              range: `stories_weekly!${colLetter(col)}${existing.rowNumber}`,
-              values: [[storiesRow[col - 1]]]
-            });
-          }
-        }
-      } else {
-        storiesToAppend.push(storiesRow);
-      }
 
       prevMetrics = metrics;
+    }
+
+    const lastFullWeekStories = allStories.filter(story => isDateInWeek(story.date, lastFullWeek));
+    const lastFullWeekStoriesKey = makeWeeklyKey(lastFullWeek.startStr, lastFullWeek.endStr, ch);
+
+    if (!existingStoriesMap.has(lastFullWeekStoriesKey)) {
+      storiesToAppend.push(computeStoriesRow(ch, lastFullWeek, lastFullWeekStories));
     }
 
     postingAnalysisRows.push(buildPostingAnalysisRow(ch, weeks, postsByWeek));
@@ -782,13 +814,12 @@ async function main() {
 
   await batchValueUpdates(s, weeklyUpdates);
   await batchValueUpdates(s, rawUpdates);
-  await batchValueUpdates(s, storiesUpdates);
 
-  await appendRows(s, "weekly_stats!A2", weeklyToAppend);
-  await appendRows(s, "posts_raw!A2", rawToAppend);
-  await appendRows(s, "stories_weekly!A2", storiesToAppend);
+  await appendRows(s, `${SHEETS.weekly}!A2`, weeklyToAppend);
+  await appendRows(s, `${SHEETS.raw}!A2`, rawToAppend);
+  await appendRows(s, `${SHEETS.stories}!A2`, storiesToAppend);
 
-  await replaceRows(s, "posting_time_analysis!A2:I", "posting_time_analysis!A2", postingAnalysisRows);
+  await replaceRows(s, `${SHEETS.postingAnalysis}!A2:J`, `${SHEETS.postingAnalysis}!A2`, postingAnalysisRows);
 
   await c.disconnect();
   console.log("FINAL BACKFILL + INCREMENTAL DONE");
