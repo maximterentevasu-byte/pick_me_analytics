@@ -40,6 +40,12 @@ function weekRange() {
   };
 }
 
+
+function isDateInWeek(date, week) {
+  if (!date || !week?.start || !week?.end) return false;
+  return date >= week.start && date < week.end;
+}
+
 function getCurrentMonday() {
   const now = new Date();
   const d = (now.getDay() + 6) % 7;
